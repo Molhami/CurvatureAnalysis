@@ -1,0 +1,2132 @@
+"""Main application window – PyQt5 version, no Tkinter."""
+from __future__ import annotations
+
+import csv
+import math
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QSplitter, QTabWidget, QScrollArea, QGroupBox, QLabel, QPushButton,
+    QSlider, QCheckBox, QComboBox, QLineEdit, QRadioButton, QButtonGroup,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QProgressDialog,
+    QMessageBox, QFileDialog, QAction, QFrame, QSizePolicy, QToolBar,
+    QSpacerItem, QSpinBox,
+)
+from PyQt5.QtCore import Qt, QPoint, QPointF, QSize, pyqtSignal, QRect
+from PyQt5.QtGui import (
+    QPainter, QPixmap, QImage, QColor, QPen, QBrush, QFont,
+    QPainterPath, QTransform,
+)
+
+from .detector import ContourDetector
+from .curvature import CurvatureEngine
+from .models import DetectParams, PreprocessParams
+from .utils import cv_to_pil_rgb, parse_bgr
+
+# ── Colour palette (Catppuccin Mocha-inspired) ───────────────────────────────
+_BG      = "#1e1e2e"
+_BG_ALT  = "#181825"
+_PANEL   = "#313244"
+_WIDGET  = "#45475a"
+_ACCENT  = "#89b4fa"
+_ACCENT2 = "#7287fd"
+_GREEN   = "#a6e3a1"
+_GREEN2  = "#40a02b"
+_TEXT    = "#cdd6f4"
+_SUBTEXT = "#a6adc8"
+_BORDER  = "#45475a"
+_RED     = "#f38ba8"
+_YELLOW  = "#f9e2af"
+
+DARK_QSS = f"""
+QMainWindow, QDialog {{ background: {_BG}; color: {_TEXT}; }}
+QWidget {{ background: {_BG}; color: {_TEXT};
+          font-family: "Segoe UI", Arial, sans-serif; font-size: 10pt; }}
+QGroupBox {{ border: 1px solid {_BORDER}; border-radius: 6px;
+            margin-top: 8px; padding: 8px 6px 6px 6px;
+            font-weight: bold; color: {_ACCENT}; background: {_BG}; }}
+QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left;
+                    left: 10px; padding: 0 4px; color: {_ACCENT}; }}
+QPushButton {{ background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER};
+               border-radius: 4px; padding: 5px 12px; min-height: 24px; }}
+QPushButton:hover {{ background: {_WIDGET}; border-color: {_ACCENT}; }}
+QPushButton:pressed {{ background: {_ACCENT}; color: {_BG}; }}
+QPushButton#accentBtn {{ background: {_ACCENT}; color: {_BG};
+                         font-weight: bold; border: none; }}
+QPushButton#accentBtn:hover {{ background: {_ACCENT2}; color: {_TEXT}; }}
+QPushButton#greenBtn {{ background: {_GREEN}; color: {_BG};
+                        font-weight: bold; border: none; }}
+QPushButton#greenBtn:hover {{ background: {_GREEN2}; color: {_TEXT}; }}
+QSlider::groove:horizontal {{ height: 4px; background: {_BORDER}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {_ACCENT}; border: none;
+                               width: 14px; height: 14px;
+                               margin: -5px 0; border-radius: 7px; }}
+QSlider::sub-page:horizontal {{ background: {_ACCENT}; border-radius: 2px; }}
+QComboBox {{ background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER};
+             border-radius: 4px; padding: 4px 8px; min-height: 24px; }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox QAbstractItemView {{ background: {_PANEL}; color: {_TEXT};
+    selection-background-color: {_ACCENT}; selection-color: {_BG};
+    border: 1px solid {_BORDER}; }}
+QCheckBox, QRadioButton {{ color: {_TEXT}; spacing: 6px; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {_BORDER};
+                        border-radius: 3px; background: {_PANEL}; }}
+QCheckBox::indicator:checked {{ background: {_ACCENT}; border-color: {_ACCENT}; }}
+QRadioButton::indicator {{ width: 16px; height: 16px; border: 1px solid {_BORDER};
+                           border-radius: 8px; background: {_PANEL}; }}
+QRadioButton::indicator:checked {{ background: {_ACCENT}; border-color: {_ACCENT}; }}
+QTableWidget {{ background: {_BG}; alternate-background-color: #252536;
+                color: {_TEXT}; gridline-color: {_PANEL};
+                border: 1px solid {_BORDER}; }}
+QTableWidget::item:selected {{ background: {_ACCENT}; color: {_BG}; }}
+QHeaderView::section {{ background: {_PANEL}; color: {_ACCENT}; padding: 5px;
+                        border: 1px solid {_BORDER}; font-weight: bold; }}
+QTabWidget::pane {{ border: 1px solid {_BORDER}; border-radius: 4px; background: {_BG}; }}
+QTabBar::tab {{ background: {_PANEL}; color: {_SUBTEXT}; padding: 8px 14px;
+                border-top-left-radius: 4px; border-top-right-radius: 4px;
+                margin-right: 2px; border: 1px solid {_BORDER}; border-bottom: none; }}
+QTabBar::tab:selected {{ background: {_ACCENT}; color: {_BG}; font-weight: bold; }}
+QTabBar::tab:hover:!selected {{ background: {_WIDGET}; color: {_TEXT}; }}
+QScrollBar:vertical {{ background: {_BG}; width: 10px; border-radius: 5px; }}
+QScrollBar::handle:vertical {{ background: {_WIDGET}; border-radius: 5px; min-height: 20px; }}
+QScrollBar::handle:vertical:hover {{ background: {_ACCENT}; }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar:horizontal {{ background: {_BG}; height: 10px; border-radius: 5px; }}
+QScrollBar::handle:horizontal {{ background: {_WIDGET}; border-radius: 5px; min-width: 20px; }}
+QScrollBar::handle:horizontal:hover {{ background: {_ACCENT}; }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+QStatusBar {{ background: {_BG_ALT}; color: {_SUBTEXT}; border-top: 1px solid {_PANEL}; }}
+QMenuBar {{ background: {_BG_ALT}; color: {_TEXT}; border-bottom: 1px solid {_PANEL}; }}
+QMenuBar::item:selected {{ background: {_PANEL}; }}
+QMenu {{ background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER}; }}
+QMenu::item:selected {{ background: {_ACCENT}; color: {_BG}; }}
+QMenu::separator {{ height: 1px; background: {_BORDER}; margin: 2px 4px; }}
+QLineEdit {{ background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER};
+             border-radius: 4px; padding: 4px 8px; min-height: 24px; }}
+QLineEdit:focus {{ border-color: {_ACCENT}; }}
+QSplitter::handle {{ background: {_BORDER}; }}
+QSplitter::handle:horizontal {{ width: 3px; }}
+QSplitter::handle:vertical {{ height: 3px; }}
+QToolBar {{ background: {_BG_ALT}; border-bottom: 1px solid {_PANEL};
+            spacing: 4px; padding: 4px; }}
+QProgressBar {{ background: {_PANEL}; border: 1px solid {_BORDER}; border-radius: 4px;
+                color: {_BG}; text-align: center; }}
+QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 3px; }}
+"""
+
+
+# ── Utility ──────────────────────────────────────────────────────────────────
+
+def _cv_to_qpixmap(img: np.ndarray) -> QPixmap:
+    """Convert an OpenCV BGR/gray/BGRA numpy array to a QPixmap."""
+    from .utils import ensure_uint8
+    img8 = ensure_uint8(img)
+    if img8.ndim == 2:
+        rgb = cv2.cvtColor(img8, cv2.COLOR_GRAY2RGB)
+    elif img8.shape[2] == 4:
+        rgb = cv2.cvtColor(img8, cv2.COLOR_BGRA2RGB)
+    else:
+        rgb = cv2.cvtColor(img8, cv2.COLOR_BGR2RGB)
+    h, w, ch = rgb.shape
+    qimg = QImage(rgb.data.tobytes(), w, h, ch * w, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+# ── LabeledSlider ─────────────────────────────────────────────────────────────
+
+class LabeledSlider(QWidget):
+    """Slider with a label and a live value readout."""
+
+    value_changed = pyqtSignal()
+
+    def __init__(
+        self,
+        label: str,
+        min_val,
+        max_val,
+        default,
+        is_float: bool = False,
+        float_scale: int = 10,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._is_float = is_float
+        self._scale = float_scale if is_float else 1
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(label)
+        lbl.setStyleSheet(f"color: {_SUBTEXT};")
+        self._val_lbl = QLabel()
+        self._val_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._val_lbl.setFixedWidth(52)
+        self._val_lbl.setStyleSheet(f"color: {_ACCENT}; font-weight: bold;")
+        top.addWidget(lbl)
+        top.addWidget(self._val_lbl)
+        layout.addLayout(top)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(
+            int(min_val * self._scale), int(max_val * self._scale)
+        )
+        self.slider.setValue(int(default * self._scale))
+        self.slider.valueChanged.connect(self._on_change)
+        layout.addWidget(self.slider)
+
+        self._update_label(self.slider.value())
+
+    def _update_label(self, int_val: int):
+        if self._is_float:
+            self._val_lbl.setText(f"{int_val / self._scale:.1f}")
+        else:
+            self._val_lbl.setText(str(int_val))
+
+    def _on_change(self, int_val: int):
+        self._update_label(int_val)
+        self.value_changed.emit()
+
+    def get_value(self):
+        v = self.slider.value()
+        return v / self._scale if self._is_float else v
+
+    def set_value(self, val):
+        self.slider.blockSignals(True)
+        self.slider.setValue(int(val * self._scale))
+        self._update_label(self.slider.value())
+        self.slider.blockSignals(False)
+
+
+# ── HistogramWidget ───────────────────────────────────────────────────────────
+
+class HistogramWidget(QWidget):
+    """Custom-painted pixel histogram."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._data: Optional[Dict[str, np.ndarray]] = None
+        self._range_max: float = 256.0
+        self._log_scale: bool = False
+        self.setMinimumWidth(250)
+        self.setMinimumHeight(150)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+
+    def set_data(
+        self,
+        data: Optional[Dict[str, np.ndarray]],
+        range_max: float = 256.0,
+    ):
+        self._data = data
+        self._range_max = float(range_max)
+        self.update()
+
+    def set_log(self, flag: bool):
+        self._log_scale = flag
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(_BG))
+
+        if not self._data:
+            painter.setPen(QColor(_SUBTEXT))
+            painter.drawText(self.rect(), Qt.AlignCenter, "No image")
+            return
+
+        w = self.width()
+        h = self.height()
+        pl, pb, pr, pt = 46, 32, 12, 10
+        aw = w - pl - pr
+        ah = h - pt - pb
+        if aw <= 0 or ah <= 0:
+            return
+
+        is_log = self._log_scale
+        max_v = max(float(np.max(d)) for d in self._data.values())
+        if max_v == 0:
+            max_v = 1.0
+        max_disp = math.log10(max_v + 1) if is_log else max_v
+
+        # Axes
+        ax_pen = QPen(QColor("#444455"), 1)
+        painter.setPen(ax_pen)
+        painter.drawLine(pl, h - pb, w - pr, h - pb)
+        painter.drawLine(pl, pt, pl, h - pb)
+
+        small_font = QFont("Segoe UI", 8)
+        painter.setFont(small_font)
+        painter.setPen(QColor(_SUBTEXT))
+
+        # X-axis ticks
+        for ratio in (0.0, 0.25, 0.5, 0.75, 1.0):
+            x = pl + int(ratio * aw)
+            painter.drawLine(x, h - pb, x, h - pb + 4)
+            val = int(ratio * (self._range_max - 1))
+            lbl = f"{val//1000}k" if val >= 1000 else str(val)
+            painter.drawText(x - 16, h - pb + 6, 32, 14, Qt.AlignCenter, lbl)
+
+        painter.drawText(pl, h - 4, aw, 10, Qt.AlignCenter, "Pixel Intensity")
+
+        # Y-axis ticks
+        for ratio in (0.0, 0.5, 1.0):
+            y = h - pb - int(ratio * ah)
+            painter.drawLine(pl - 4, y, pl, y)
+            if is_log:
+                val = int(10 ** (ratio * max_disp) - 1)
+            else:
+                val = int(ratio * max_v)
+            lbl = f"{val//1000}k" if val >= 1000 else str(val)
+            painter.drawText(pl - 44, y - 7, 40, 14, Qt.AlignRight | Qt.AlignVCenter, lbl)
+
+        # Channel colours (BGR → display: R G B or gray)
+        ch_colors = {
+            "gray": QColor("#cccccc"),
+            "b": QColor("#5B9BD5"),
+            "g": QColor("#70AD47"),
+            "r": QColor("#FF6B6B"),
+        }
+        order = ["gray"] if "gray" in self._data else ["r", "g", "b"]
+
+        info_y = pt
+        peak_font = QFont("Segoe UI", 8)
+        peak_font.setBold(True)
+        painter.setFont(peak_font)
+        painter.setPen(QColor(_SUBTEXT))
+        painter.drawText(w - pr - 140, info_y, 140, 12, Qt.AlignRight, "Peak intensity:")
+        info_y += 14
+
+        for key in order:
+            if key not in self._data:
+                continue
+            h_data = self._data[key]
+            color = ch_colors.get(key, QColor("white"))
+            pen = QPen(color, 1.5)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+
+            path = QPainterPath()
+            first = True
+            for i in range(256):
+                x = pl + int(i * aw / 255.0)
+                v = float(h_data[i])
+                v_d = math.log10(v + 1) if is_log else v
+                y = h - pb - int((v_d / max_disp) * ah)
+                y = max(pt, min(h - pb, y))
+                if first:
+                    path.moveTo(x, y)
+                    first = False
+                else:
+                    path.lineTo(x, y)
+            painter.drawPath(path)
+
+            peak_bin = int(np.argmax(h_data))
+            peak_intensity = int(peak_bin * (self._range_max / 256.0))
+            peak_count = int(h_data[peak_bin])
+            pi_s = f"{peak_intensity//1000}k" if (self._range_max > 256 and peak_intensity >= 1000) else str(peak_intensity)
+            pc_s = f"{peak_count//1000}k" if peak_count >= 1000 else str(peak_count)
+            ch_name = key.upper() if key != "gray" else "Gray"
+            painter.setPen(color)
+            painter.setFont(small_font)
+            painter.drawText(w - pr - 140, info_y, 140, 12,
+                             Qt.AlignRight, f"{ch_name}: {pi_s} ({pc_s} px)")
+            info_y += 12
+
+        painter.end()
+
+
+# ── ImageCanvas ──────────────────────────────────────────────────────────────
+
+class ImageCanvas(QWidget):
+    """Zoomable/pannable image canvas with overlay drawing."""
+
+    zoom_changed = pyqtSignal(float)
+    points_captured = pyqtSignal(list, list)   # xs, ys
+    status_message = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CrossCursor)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_OpaquePaintEvent)
+
+        # Viewport
+        self.zoom: float = 1.0
+        self.pan_x: float = 0.0
+        self.pan_y: float = 0.0
+        self._panning = False
+        self._last_mouse = QPoint()
+
+        # Image cache
+        self._cv_img: Optional[np.ndarray] = None
+        self._pixmap: Optional[QPixmap] = None
+
+        # Overlays
+        self.contours: List[np.ndarray] = []
+        self.selected_contour_idx: Optional[int] = None
+        self.points_x: List[float] = []
+        self.points_y: List[float] = []
+        self.curve_data: Optional[Dict] = None
+        self.show_vectors: bool = False
+        self.vec_density: int = 15
+        self.vec_len: float = 50.0
+
+        # Drawing
+        self.draw_enabled: bool = False
+        self.draw_mode: str = "freehand"
+        self._is_drawing: bool = False
+        self._circle_start: Tuple[float, float] = (0.0, 0.0)
+        self._circle_r: float = 0.0
+
+        # Hover
+        self._hover_data: Optional[Tuple] = None  # (sx, sy, k, r, nx, ny, tx, ty)
+
+        self.setStyleSheet(f"background: #1a1a2e;")
+        self.setMinimumSize(300, 200)
+
+    # -- Coordinate helpers ------------------------------------------------
+
+    def to_screen(self, wx: float, wy: float) -> Tuple[float, float]:
+        return wx * self.zoom + self.pan_x, wy * self.zoom + self.pan_y
+
+    def to_world(self, sx: float, sy: float) -> Tuple[float, float]:
+        return (sx - self.pan_x) / self.zoom, (sy - self.pan_y) / self.zoom
+
+    # -- Image update -------------------------------------------------------
+
+    def set_image(self, cv_img: Optional[np.ndarray]):
+        self._cv_img = cv_img
+        self._pixmap = _cv_to_qpixmap(cv_img) if cv_img is not None else None
+        self.update()
+
+    def fit_to_view(self):
+        if self._cv_img is None:
+            return
+        ih, iw = self._cv_img.shape[:2]
+        if iw < 1 or ih < 1:
+            return
+        cw, ch = self.width(), self.height()
+        if cw < 2 or ch < 2:
+            return
+        self.zoom = float(np.clip(min(cw / iw, ch / ih), 0.05, 30.0))
+        self.pan_x = (cw - iw * self.zoom) / 2.0
+        self.pan_y = (ch - ih * self.zoom) / 2.0
+        self.zoom_changed.emit(self.zoom)
+        self.update()
+
+    # -- Paint --------------------------------------------------------------
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#1a1a2e"))
+
+        if self._pixmap is None:
+            painter.setPen(QColor("#444466"))
+            painter.setFont(QFont("Segoe UI", 16))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Open an image  (Ctrl+O)")
+            return
+
+        # Draw the base image via transform
+        transform = QTransform()
+        transform.translate(self.pan_x, self.pan_y)
+        transform.scale(self.zoom, self.zoom)
+        painter.setTransform(transform)
+
+        if self._pixmap:
+            painter.drawPixmap(0, 0, self._pixmap)
+
+        # Back to identity for screen-space overlays
+        painter.resetTransform()
+
+        self._paint_selected_contour(painter)
+        self._paint_points(painter)
+        self._paint_curve(painter)
+        if self.show_vectors and self.curve_data:
+            self._paint_vectors(painter)
+        if self._is_drawing and self.draw_mode == "circle" and self._circle_r > 1e-6:
+            self._paint_circle_preview(painter)
+        if self._hover_data:
+            self._paint_hover(painter)
+
+        painter.end()
+
+    def _paint_selected_contour(self, painter: QPainter):
+        if self.selected_contour_idx is None or not self.contours:
+            return
+        idx = self.selected_contour_idx
+        if idx < 0 or idx >= len(self.contours):
+            return
+        pts = self.contours[idx].reshape(-1, 2).astype(float)
+        pen = QPen(QColor("#ff9f43"), 2)
+        painter.setPen(pen)
+        path = QPainterPath()
+        sx, sy = self.to_screen(float(pts[0, 0]), float(pts[0, 1]))
+        path.moveTo(sx, sy)
+        for x, y in pts[1:]:
+            sx, sy = self.to_screen(float(x), float(y))
+            path.lineTo(sx, sy)
+        # close
+        sx0, sy0 = self.to_screen(float(pts[0, 0]), float(pts[0, 1]))
+        path.lineTo(sx0, sy0)
+        painter.drawPath(path)
+
+    def _paint_points(self, painter: QPainter):
+        if len(self.points_x) < 2:
+            return
+        pen = QPen(QColor("#f9e2af"), 1)
+        painter.setPen(pen)
+        path = QPainterPath()
+        sx, sy = self.to_screen(self.points_x[0], self.points_y[0])
+        path.moveTo(sx, sy)
+        for wx, wy in zip(self.points_x[1:], self.points_y[1:]):
+            sx, sy = self.to_screen(wx, wy)
+            path.lineTo(sx, sy)
+        painter.drawPath(path)
+
+    def _paint_curve(self, painter: QPainter):
+        data = self.curve_data
+        if data is None:
+            return
+        xs, ys = data["x"], data["y"]
+        pen = QPen(QColor("#89dceb"), 2)
+        painter.setPen(pen)
+        path = QPainterPath()
+        sx, sy = self.to_screen(float(xs[0]), float(ys[0]))
+        path.moveTo(sx, sy)
+        for i in range(1, len(xs)):
+            sx, sy = self.to_screen(float(xs[i]), float(ys[i]))
+            path.lineTo(sx, sy)
+        painter.drawPath(path)
+
+    def _paint_vectors(self, painter: QPainter):
+        data = self.curve_data
+        if data is None:
+            return
+        xs, ys = data["x"], data["y"]
+        tx, ty = data["tx"], data["ty"]
+        nx, ny = data["nx"], data["ny"]
+        step = max(1, int(self.vec_density))
+        vlen = float(self.vec_len)
+
+        tang_pen = QPen(QColor("#cba6f7"), 1)
+        norm_pen = QPen(QColor("#f9e2af"), 1)
+
+        for i in range(0, len(xs), step):
+            sx, sy = self.to_screen(float(xs[i]), float(ys[i]))
+
+            painter.setPen(tang_pen)
+            painter.drawLine(
+                QPointF(sx - float(tx[i]) * vlen, sy - float(ty[i]) * vlen),
+                QPointF(sx + float(tx[i]) * vlen, sy + float(ty[i]) * vlen),
+            )
+            painter.setPen(norm_pen)
+            painter.drawLine(
+                QPointF(sx, sy),
+                QPointF(sx + float(nx[i]) * vlen, sy + float(ny[i]) * vlen),
+            )
+
+    def _paint_circle_preview(self, painter: QPainter):
+        cx, cy = self.to_screen(*self._circle_start)
+        r = self._circle_r * self.zoom
+        pen = QPen(QColor("#f9e2af"), 2, Qt.DashLine)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+    def _paint_hover(self, painter: QPainter):
+        sx, sy, k, r, nx_, ny_, tx_, ty_ = self._hover_data  # type: ignore
+
+        # Tangent line
+        tlen = 100.0
+        pen = QPen(QColor("#cba6f7"), 2, Qt.DashLine)
+        painter.setPen(pen)
+        painter.drawLine(
+            QPointF(sx - tx_ * tlen, sy - ty_ * tlen),
+            QPointF(sx + tx_ * tlen, sy + ty_ * tlen),
+        )
+
+        # Osculating circle
+        r_screen = r * self.zoom
+        r_vis = min(max(r_screen, 0.0), 2000.0)
+        csx, csy = sx + nx_ * r_vis, sy + ny_ * r_vis
+
+        # Point marker
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor("#f38ba8")))
+        painter.drawEllipse(QPointF(sx, sy), 4, 4)
+
+        # Radius line
+        pen2 = QPen(QColor("#f38ba8"), 1, Qt.DashLine)
+        painter.setPen(pen2)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(QPointF(sx, sy), QPointF(csx, csy))
+
+        if r_vis < 1200:
+            pen3 = QPen(QColor("#a6e3a1"), 2)
+            painter.setPen(pen3)
+            painter.drawEllipse(QPointF(csx, csy), r_vis, r_vis)
+
+        # Text label
+        txt = f"R: {r:.1f}\nk: {k:.4f}"
+        painter.setPen(QColor(_TEXT))
+        font = QFont("Segoe UI", 10)
+        font.setBold(True)
+        painter.setFont(font)
+        # shadow
+        painter.setPen(QColor("#000000"))
+        painter.drawText(QRect(int(sx) + 13, int(sy) - 38, 120, 36), 0, txt)
+        painter.setPen(QColor(_TEXT))
+        painter.drawText(QRect(int(sx) + 12, int(sy) - 39, 120, 36), 0, txt)
+
+    # -- Wheel (zoom) --------------------------------------------------------
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        scale = 1.1 if delta > 0 else 0.9
+        mx, my = event.x(), event.y()
+        mwx = (mx - self.pan_x) / self.zoom
+        mwy = (my - self.pan_y) / self.zoom
+        self.zoom = float(np.clip(self.zoom * scale, 0.05, 30.0))
+        self.pan_x = mx - mwx * self.zoom
+        self.pan_y = my - mwy * self.zoom
+        self.zoom_changed.emit(self.zoom)
+        self.update()
+
+    # -- Mouse events (pan + draw + hover) -----------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self._panning = True
+            self._last_mouse = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif event.button() == Qt.LeftButton and self.draw_enabled:
+            self._is_drawing = True
+            wx, wy = self.to_world(event.x(), event.y())
+            self._circle_start = (wx, wy)
+            self._circle_r = 0.0
+            if self.draw_mode == "freehand":
+                self.points_x = [wx]
+                self.points_y = [wy]
+            self.curve_data = None
+            self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._panning:
+            dx = event.x() - self._last_mouse.x()
+            dy = event.y() - self._last_mouse.y()
+            self.pan_x += dx
+            self.pan_y += dy
+            self._last_mouse = event.pos()
+            self.update()
+            return
+
+        if self._is_drawing and self.draw_enabled:
+            wx, wy = self.to_world(event.x(), event.y())
+            if self.draw_mode == "freehand":
+                self.points_x.append(wx)
+                self.points_y.append(wy)
+            else:  # circle preview
+                self._circle_r = math.hypot(
+                    wx - self._circle_start[0], wy - self._circle_start[1]
+                )
+            self.update()
+            return
+
+        # Hover inspection
+        data = self.curve_data
+        if data is not None:
+            mx, my = self.to_world(event.x(), event.y())
+            xs, ys = data["x"], data["y"]
+            d2 = (xs - mx) ** 2 + (ys - my) ** 2
+            idx = int(np.argmin(d2))
+            sx, sy = self.to_screen(float(xs[idx]), float(ys[idx]))
+            if math.hypot(sx - event.x(), sy - event.y()) < 35:
+                self._hover_data = (
+                    sx, sy,
+                    float(data["k"][idx]), float(data["r"][idx]),
+                    float(data["nx"][idx]), float(data["ny"][idx]),
+                    float(data["tx"][idx]), float(data["ty"][idx]),
+                )
+                self.update()
+                return
+        if self._hover_data is not None:
+            self._hover_data = None
+            self.update()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self._panning = False
+            self.setCursor(Qt.CrossCursor)
+        elif event.button() == Qt.LeftButton and self._is_drawing:
+            self._is_drawing = False
+            if self.draw_mode == "circle":
+                wx, wy = self.to_world(event.x(), event.y())
+                r = math.hypot(wx - self._circle_start[0],
+                               wy - self._circle_start[1])
+                if r > 1e-6:
+                    angles = np.linspace(0, 2 * math.pi, 200)
+                    cx0, cy0 = self._circle_start
+                    self.points_x = (cx0 + r * np.cos(angles)).tolist()
+                    self.points_y = (cy0 + r * np.sin(angles)).tolist()
+            n = len(self.points_x)
+            self.status_message.emit(
+                f"Points captured: {n}. Click 'Compute curvature'."
+            )
+            self.points_captured.emit(self.points_x[:], self.points_y[:])
+            self.update()
+
+
+# ── MainWindow ───────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    """Top-level PyQt5 window – replaces Tkinter CombinedApp."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Tip Curvature Analyzer  v2")
+        self.resize(1520, 960)
+        self.setMinimumSize(1100, 700)
+
+        self.detector = ContourDetector()
+        self.curv = CurvatureEngine()
+
+        self.current_view: str = "preprocessed"
+        self.selected_contour_index: Optional[int] = None
+        self.frame_pre_params: Dict[int, Tuple[float, int]] = {}
+        self._active_pre_key: Optional[int] = None
+
+        self._build_menu()
+        self._build_toolbar()
+        self._build_central()
+        self.statusBar().showMessage("Ready — Ctrl+O to open an image.")
+
+    # ── Menu ─────────────────────────────────────────────────────────────────
+
+    def _build_menu(self):
+        mb = self.menuBar()
+
+        file_m = mb.addMenu("File")
+        file_m.addAction(self._act("Open Image  (Ctrl+O)", self.open_image, "Ctrl+O"))
+        file_m.addSeparator()
+        file_m.addAction(self._act("Save Annotated  (Ctrl+S)", self.save_annotated, "Ctrl+S"))
+        file_m.addAction(self._act("Save Binary Mask", self.save_binary))
+        file_m.addAction(self._act("Save Curvature Image", self.save_curvature_image))
+        file_m.addSeparator()
+        file_m.addAction(self._act("Export Properties CSV (Current Frame)", self.export_csv_current))
+        file_m.addAction(self._act("Export Properties CSV (All Detected Frames)", self.export_csv_all))
+        file_m.addSeparator()
+        file_m.addAction(self._act("Export Contour Points (Current Frame)", self.export_contours_current))
+        file_m.addAction(self._act("Export Contour Points (All Frames)", self.export_contours_all))
+        file_m.addSeparator()
+        file_m.addAction(self._act("Export Curvature (Current Frame)", self.export_curvature_current))
+        file_m.addAction(self._act("Export Curvature (All Frames)", self.export_curvature_all))
+        file_m.addSeparator()
+        file_m.addAction(self._act("Exit", self.close))
+
+        view_m = mb.addMenu("View")
+        view_m.addAction(self._act("Preprocessed", lambda: self.set_view("preprocessed")))
+        view_m.addAction(self._act("Binary Mask", lambda: self.set_view("binary")))
+        view_m.addAction(self._act("Contours", lambda: self.set_view("contours")))
+        view_m.addSeparator()
+        view_m.addAction(self._act("Fit to View  (F)", self.fit_to_view, "F"))
+
+        help_m = mb.addMenu("Help")
+        help_m.addAction(self._act("About", self._about))
+
+    def _act(self, label: str, slot, shortcut: str = "") -> QAction:
+        a = QAction(label, self)
+        if shortcut:
+            a.setShortcut(shortcut)
+        a.triggered.connect(slot)
+        return a
+
+    # ── Toolbar ───────────────────────────────────────────────────────────────
+
+    def _build_toolbar(self):
+        tb = self.addToolBar("Main")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(16, 16))
+
+        btn_open = QPushButton("  Open")
+        btn_open.clicked.connect(self.open_image)
+        tb.addWidget(btn_open)
+
+        tb.addSeparator()
+
+        btn_detect = QPushButton("  Detect Frame")
+        btn_detect.setObjectName("accentBtn")
+        btn_detect.clicked.connect(self.detect_current)
+        tb.addWidget(btn_detect)
+
+        btn_all = QPushButton("  Detect All")
+        btn_all.setObjectName("greenBtn")
+        btn_all.clicked.connect(self.detect_all)
+        tb.addWidget(btn_all)
+
+        tb.addSeparator()
+
+        for label, view in (("Preproc.", "preprocessed"),
+                            ("Binary", "binary"), ("Contours", "contours")):
+            b = QPushButton(label)
+            b.clicked.connect(lambda _c, v=view: self.set_view(v))
+            tb.addWidget(b)
+
+        tb.addSeparator()
+
+        btn_fit = QPushButton("Fit")
+        btn_fit.clicked.connect(self.fit_to_view)
+        tb.addWidget(btn_fit)
+
+        # Zoom label (right-aligned via spacer)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
+        self.zoom_label = QLabel("Zoom: 1.00×")
+        self.zoom_label.setStyleSheet(f"color: {_SUBTEXT}; padding-right: 8px;")
+        tb.addWidget(self.zoom_label)
+
+    # ── Central layout ────────────────────────────────────────────────────────
+
+    def _build_central(self):
+        root_splitter = QSplitter(Qt.Horizontal)
+        root_splitter.setHandleWidth(4)
+        self.setCentralWidget(root_splitter)
+
+        # Left: scrollable tab panel
+        left_scroll = QScrollArea()
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        left_scroll.setMinimumWidth(350)
+        left_scroll.setStyleSheet(
+            f"QScrollArea {{ border: none; background: {_BG}; }}"
+        )
+
+        left_container = QWidget()
+        left_vbox = QVBoxLayout(left_container)
+        left_vbox.setContentsMargins(6, 6, 6, 6)
+        left_vbox.setSpacing(0)
+
+        self.nb = QTabWidget()
+        self.nb.currentChanged.connect(self._on_tab_changed)
+        left_vbox.addWidget(self.nb)
+
+        tab_pre = QWidget()
+        tab_cnt = QWidget()
+        tab_curv = QWidget()
+        self.nb.addTab(tab_pre, "Preprocessing")
+        self.nb.addTab(tab_cnt, "Contour")
+        self.nb.addTab(tab_curv, "Curvature")
+
+        self._build_preprocessing_tab(tab_pre)
+        self._build_contour_tab(tab_cnt)
+        self._build_curvature_tab(tab_curv)
+
+        left_scroll.setWidget(left_container)
+        root_splitter.addWidget(left_scroll)
+
+        # Right: frame nav + canvas/histogram + table
+        right_w = QWidget()
+        right_vbox = QVBoxLayout(right_w)
+        right_vbox.setContentsMargins(4, 4, 4, 4)
+        right_vbox.setSpacing(4)
+
+        self._build_frame_nav(right_vbox)
+
+        # Canvas + histogram header
+        view_row = QHBoxLayout()
+        self.view_label = QLabel("View: (none)")
+        self.view_label.setStyleSheet(
+            f"color: {_ACCENT}; font-weight: bold; font-size: 11pt;"
+        )
+        view_row.addWidget(self.view_label)
+        view_row.addStretch()
+        right_vbox.addLayout(view_row)
+
+        # Splitter: image canvas | histogram   (horizontal)
+        img_hist_split = QSplitter(Qt.Horizontal)
+
+        self.canvas = ImageCanvas()
+        self.canvas.zoom_changed.connect(
+            lambda z: self.zoom_label.setText(f"Zoom: {z:.2f}×")
+        )
+        self.canvas.status_message.connect(self.statusBar().showMessage)
+        self.canvas.points_captured.connect(self._on_canvas_points)
+        img_hist_split.addWidget(self.canvas)
+
+        hist_w = QWidget()
+        hist_vbox = QVBoxLayout(hist_w)
+        hist_vbox.setContentsMargins(4, 4, 4, 4)
+        hist_vbox.setSpacing(4)
+
+        hist_header = QHBoxLayout()
+        lbl_h = QLabel("Pixel Histogram")
+        lbl_h.setStyleSheet(f"color: {_ACCENT}; font-weight: bold;")
+        hist_header.addWidget(lbl_h)
+        hist_header.addStretch()
+        self._log_cb = QCheckBox("Log scale")
+        self._log_cb.stateChanged.connect(
+            lambda s: (self.histogram.set_log(bool(s)), None)
+        )
+        hist_header.addWidget(self._log_cb)
+        hist_vbox.addLayout(hist_header)
+
+        self.histogram = HistogramWidget()
+        hist_vbox.addWidget(self.histogram)
+        img_hist_split.addWidget(hist_w)
+
+        # Allow histogram to take up more default space
+        img_hist_split.setStretchFactor(0, 2)
+        img_hist_split.setStretchFactor(1, 1)
+        img_hist_split.setCollapsible(0, False)
+        img_hist_split.setCollapsible(1, False)
+
+        # Vertical splitter: (canvas+hist) | table
+        vert_split = QSplitter(Qt.Vertical)
+        vert_split.addWidget(img_hist_split)
+
+        table_w = QWidget()
+        self._build_table(table_w)
+        vert_split.addWidget(table_w)
+        vert_split.setStretchFactor(0, 3)
+        vert_split.setStretchFactor(1, 1)
+
+        right_vbox.addWidget(vert_split, stretch=1)
+        root_splitter.addWidget(right_w)
+
+        root_splitter.setStretchFactor(0, 0)
+        root_splitter.setStretchFactor(1, 1)
+
+    # ── Frame navigation ──────────────────────────────────────────────────────
+
+    def _build_frame_nav(self, layout):
+        box = QGroupBox("Frame Navigation")
+        row = QHBoxLayout(box)
+        row.setContentsMargins(8, 4, 8, 4)
+        row.setSpacing(6)
+
+        btn_prev = QPushButton("<")
+        btn_prev.setFixedWidth(30)
+        btn_prev.clicked.connect(self.prev_frame)
+        row.addWidget(btn_prev)
+
+        self.frame_slider = QSlider(Qt.Horizontal)
+        self.frame_slider.setRange(0, 0)
+        self.frame_slider.valueChanged.connect(self._on_frame_slider)
+        row.addWidget(self.frame_slider, stretch=1)
+
+        btn_next = QPushButton(">")
+        btn_next.setFixedWidth(30)
+        btn_next.clicked.connect(self.next_frame)
+        row.addWidget(btn_next)
+
+        self.frame_info_lbl = QLabel("No image loaded")
+        self.frame_info_lbl.setStyleSheet(f"color: {_ACCENT}; font-weight: bold;")
+        self.frame_info_lbl.setFixedWidth(130)
+        self.frame_info_lbl.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.frame_info_lbl)
+
+        row.addWidget(QLabel("Go to:"))
+        self.frame_entry = QLineEdit()
+        self.frame_entry.setText("1")
+        self.frame_entry.setFixedWidth(48)
+        self.frame_entry.returnPressed.connect(self._on_frame_entry)
+        row.addWidget(self.frame_entry)
+
+        self.detect_info_lbl = QLabel("")
+        self.detect_info_lbl.setStyleSheet(f"color: {_SUBTEXT};")
+        row.addWidget(self.detect_info_lbl)
+
+        layout.addWidget(box)
+
+    # ── Contour table ─────────────────────────────────────────────────────────
+
+    def _build_table(self, parent: QWidget):
+        vbox = QVBoxLayout(parent)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(4)
+
+        hdr = QLabel("Contour Properties  (select a row)")
+        hdr.setStyleSheet(f"color: {_ACCENT}; font-weight: bold; font-size: 11pt; padding: 4px 6px;")
+        vbox.addWidget(hdr)
+
+        cols = ["#", "Area", "Perimeter", "Centroid", "BBox",
+                "Circularity", "Aspect Ratio", "Solidity"]
+        self.table = QTableWidget(0, len(cols))
+        self.table.setHorizontalHeaderLabels(cols)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setStretchLastSection(True)
+
+        col_widths = [40, 80, 80, 110, 150, 80, 90, 70]
+        for i, w in enumerate(col_widths):
+            self.table.setColumnWidth(i, w)
+
+        self.table.itemSelectionChanged.connect(self._on_table_select)
+        vbox.addWidget(self.table)
+
+    # ── Preprocessing tab ─────────────────────────────────────────────────────
+
+    def _build_preprocessing_tab(self, parent: QWidget):
+        vbox = QVBoxLayout(parent)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(8)
+
+        # Preprocessing params
+        grp = QGroupBox("Preprocessing")
+        g_lay = QVBoxLayout(grp)
+        g_lay.setSpacing(6)
+
+        self.pre_invert_cb = QCheckBox("Invert image")
+        self.pre_invert_cb.stateChanged.connect(self._on_pre_change)
+        g_lay.addWidget(self.pre_invert_cb)
+
+        self.pre_alpha_sl = LabeledSlider(
+            "Contrast (alpha):", 0.1, 20.0, 1.0, is_float=True, float_scale=10
+        )
+        self.pre_alpha_sl.value_changed.connect(self._on_pre_change)
+        g_lay.addWidget(self.pre_alpha_sl)
+
+        self.pre_beta_sl = LabeledSlider("Brightness (beta):", -100, 100, 0)
+        self.pre_beta_sl.value_changed.connect(self._on_pre_change)
+        g_lay.addWidget(self.pre_beta_sl)
+
+        vbox.addWidget(grp)
+
+        # Blur
+        grp_blur = QGroupBox("Gaussian Blur")
+        gb_lay = QVBoxLayout(grp_blur)
+        self.pre_blur_sl = LabeledSlider("Blur ksize (odd):", 1, 31, 5)
+        self.pre_blur_sl.value_changed.connect(self._on_pre_change)
+        gb_lay.addWidget(self.pre_blur_sl)
+        vbox.addWidget(grp_blur)
+
+        # Peak normalization
+        grp_norm = QGroupBox("Peak Normalization")
+        gn_lay = QVBoxLayout(grp_norm)
+        gn_lay.setSpacing(6)
+
+        lbl_target = QLabel("Target peak intensity (0–255):")
+        lbl_target.setStyleSheet(f"color: {_SUBTEXT};")
+        gn_lay.addWidget(lbl_target)
+
+        self.peak_target_sb = QSpinBox()
+        self.peak_target_sb.setRange(1, 255)
+        self.peak_target_sb.setValue(200)
+        self.peak_target_sb.setSingleStep(1)
+        self.peak_target_sb.setStyleSheet(
+            f"background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER};"
+            f" border-radius: 4px; padding: 2px 6px;"
+        )
+        gn_lay.addWidget(self.peak_target_sb)
+
+        btn_norm = QPushButton("Apply to Stack")
+        btn_norm.setObjectName("accentBtn")
+        btn_norm.clicked.connect(self._apply_peak_normalization)
+        gn_lay.addWidget(btn_norm)
+
+        self.peak_norm_lbl = QLabel("")
+        self.peak_norm_lbl.setWordWrap(True)
+        self.peak_norm_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
+        gn_lay.addWidget(self.peak_norm_lbl)
+
+        vbox.addWidget(grp_norm)
+
+        # Reset
+        grp_act = QGroupBox("Actions")
+        ga_lay = QVBoxLayout(grp_act)
+        btn_rst = QPushButton("Reset defaults")
+        btn_rst.clicked.connect(self._reset_pre_defaults)
+        ga_lay.addWidget(btn_rst)
+        vbox.addWidget(grp_act)
+
+        # Preview
+        grp_prev = QGroupBox("Preview")
+        gp_lay = QVBoxLayout(grp_prev)
+        self.pre_preview = QLabel()
+        self.pre_preview.setAlignment(Qt.AlignCenter)
+        self.pre_preview.setMinimumHeight(160)
+        self.pre_preview.setStyleSheet(f"background: #0d0d1a; border-radius: 4px;")
+        gp_lay.addWidget(self.pre_preview)
+        self.pre_msg_lbl = QLabel("Open an image to preview preprocessing.")
+        self.pre_msg_lbl.setWordWrap(True)
+        self.pre_msg_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt; padding: 2px;")
+        gp_lay.addWidget(self.pre_msg_lbl)
+        vbox.addWidget(grp_prev, stretch=1)
+
+        vbox.addStretch()
+
+    # ── Contour tab ───────────────────────────────────────────────────────────
+
+    def _build_contour_tab(self, parent: QWidget):
+        vbox = QVBoxLayout(parent)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(8)
+
+        # Method
+        grp_m = QGroupBox("Detection Method")
+        gm_lay = QVBoxLayout(grp_m)
+        gm_lay.addWidget(QLabel("Method:"))
+        self.method_cb = QComboBox()
+        methods = ["Otsu Threshold", "Binary Threshold", "Inv. Binary Threshold",
+                   "Adaptive Mean", "Adaptive Gaussian", "Canny Edge"]
+        self.method_cb.addItems(methods)
+        self.method_cb.currentTextChanged.connect(self._update_method_frames)
+        gm_lay.addWidget(self.method_cb)
+        vbox.addWidget(grp_m)
+
+        # Detection preprocessing
+        grp_dp = QGroupBox("Detection Preprocessing")
+        gdp = QVBoxLayout(grp_dp)
+        self.det_blur_sl = LabeledSlider("Extra blur ksize (odd):", 1, 31, 5)
+        gdp.addWidget(self.det_blur_sl)
+        self.use_morph_cb = QCheckBox("Morphological closing")
+        self.use_morph_cb.setChecked(True)
+        gdp.addWidget(self.use_morph_cb)
+        self.morph_ksize_sl = LabeledSlider("Morph ksize (odd):", 1, 21, 5)
+        gdp.addWidget(self.morph_ksize_sl)
+        vbox.addWidget(grp_dp)
+
+        # Threshold / Canny (toggleable)
+        self.grp_thresh = QGroupBox("Threshold")
+        gt = QVBoxLayout(self.grp_thresh)
+        self.thresh_sl = LabeledSlider("Threshold value:", 0, 255, 127)
+        gt.addWidget(self.thresh_sl)
+        vbox.addWidget(self.grp_thresh)
+
+        self.grp_canny = QGroupBox("Canny")
+        gc = QVBoxLayout(self.grp_canny)
+        self.canny_low_sl = LabeledSlider("Low:", 0, 500, 50)
+        self.canny_high_sl = LabeledSlider("High:", 0, 500, 150)
+        gc.addWidget(self.canny_low_sl)
+        gc.addWidget(self.canny_high_sl)
+        vbox.addWidget(self.grp_canny)
+
+        self._update_method_frames()
+
+        # Filtering
+        grp_f = QGroupBox("Filtering")
+        gf = QVBoxLayout(grp_f)
+        self.min_area_sl = LabeledSlider("Min area:", 0, 20000, 100)
+        self.max_area_sl = LabeledSlider("Max area (0=off):", 0, 500000, 0)
+        gf.addWidget(self.min_area_sl)
+        gf.addWidget(self.max_area_sl)
+        vbox.addWidget(grp_f)
+
+        # Drawing options
+        grp_d = QGroupBox("Drawing")
+        gd = QVBoxLayout(grp_d)
+        self.draw_bbox_cb = QCheckBox("Bounding boxes")
+        self.draw_bbox_cb.setChecked(True)
+        self.draw_centroid_cb = QCheckBox("Centroids")
+        self.draw_centroid_cb.setChecked(True)
+        self.draw_labels_cb = QCheckBox("Labels")
+        self.draw_labels_cb.setChecked(True)
+        gd.addWidget(self.draw_bbox_cb)
+        gd.addWidget(self.draw_centroid_cb)
+        gd.addWidget(self.draw_labels_cb)
+        self.thickness_sl = LabeledSlider("Line thickness:", 1, 10, 2)
+        gd.addWidget(self.thickness_sl)
+        vbox.addWidget(grp_d)
+
+        # Detect buttons
+        btn_det = QPushButton("Detect Current Frame")
+        btn_det.setObjectName("accentBtn")
+        btn_det.clicked.connect(self.detect_current)
+        vbox.addWidget(btn_det)
+
+        btn_all = QPushButton("Detect All Frames")
+        btn_all.setObjectName("greenBtn")
+        btn_all.clicked.connect(self.detect_all)
+        vbox.addWidget(btn_all)
+
+        note = QLabel("Preprocessing is auto-cached when entering this tab.")
+        note.setWordWrap(True)
+        note.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
+        vbox.addWidget(note)
+        vbox.addStretch()
+
+    @staticmethod
+    def _color_row(layout, label: str, default: str) -> QLineEdit:
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        lbl.setStyleSheet(f"color: {_SUBTEXT};")
+        row.addWidget(lbl)
+        edit = QLineEdit(default)
+        edit.setFixedWidth(90)
+        row.addWidget(edit)
+        layout.addLayout(row)
+        return edit
+
+    # ── Curvature tab ─────────────────────────────────────────────────────────
+
+    def _build_curvature_tab(self, parent: QWidget):
+        vbox = QVBoxLayout(parent)
+        vbox.setContentsMargins(8, 8, 8, 8)
+        vbox.setSpacing(8)
+
+        grp_src = QGroupBox("Source of Points")
+        gs = QVBoxLayout(grp_src)
+
+        self.draw_enabled_cb = QCheckBox("Enable manual drawing (left-drag)")
+        self.draw_enabled_cb.stateChanged.connect(self._on_draw_enabled)
+        gs.addWidget(self.draw_enabled_cb)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Draw mode:"))
+        self.mode_freehand = QRadioButton("Freehand")
+        self.mode_freehand.setChecked(True)
+        self.mode_circle = QRadioButton("Circle")
+        mode_row.addWidget(self.mode_freehand)
+        mode_row.addWidget(self.mode_circle)
+        mode_row.addStretch()
+        gs.addLayout(mode_row)
+
+        btn_row = QHBoxLayout()
+        btn_sel = QPushButton("Select contour")
+        btn_sel.clicked.connect(self.use_selected_contour)
+        btn_lg = QPushButton("Largest contour")
+        btn_lg.clicked.connect(self.use_largest_contour)
+        btn_clr = QPushButton("Clear")
+        btn_clr.clicked.connect(self.clear_curvature)
+        btn_row.addWidget(btn_sel)
+        btn_row.addWidget(btn_lg)
+        btn_row.addWidget(btn_clr)
+        gs.addLayout(btn_row)
+        vbox.addWidget(grp_src)
+
+        grp_calc = QGroupBox("Spline & Curvature")
+        gc = QVBoxLayout(grp_calc)
+        self.smooth_sl = LabeledSlider("Smoothing factor (s):", 0, 2000, 300)
+        self.res_sl = LabeledSlider(
+            "Resolution multiplier:", 1.0, 5.0, 2.0, is_float=True, float_scale=10
+        )
+        gc.addWidget(self.smooth_sl)
+        gc.addWidget(self.res_sl)
+        btn_compute = QPushButton("Compute Curvature (Current)")
+        btn_compute.setObjectName("accentBtn")
+        btn_compute.clicked.connect(self.compute_curvature)
+
+        btn_compute_all = QPushButton("Compute Curvature (All Frames)")
+        btn_compute_all.setObjectName("greenBtn")
+        btn_compute_all.clicked.connect(self.compute_curvature_all)
+
+        calc_btn_row = QHBoxLayout()
+        calc_btn_row.addWidget(btn_compute)
+        calc_btn_row.addWidget(btn_compute_all)
+        gc.addLayout(calc_btn_row)
+        vbox.addWidget(grp_calc)
+
+        grp_vis = QGroupBox("Visualization")
+        gv = QVBoxLayout(grp_vis)
+        self.vec_density_sl = LabeledSlider("Vector step (density):", 5, 50, 15)
+        self.vec_len_sl = LabeledSlider("Vector length (px):", 10, 500, 50)
+        self.vec_density_sl.value_changed.connect(self._on_vec_change)
+        self.vec_len_sl.value_changed.connect(self._on_vec_change)
+        gv.addWidget(self.vec_density_sl)
+        gv.addWidget(self.vec_len_sl)
+        self.show_vec_cb = QCheckBox("Show tangents / normals")
+        self.show_vec_cb.stateChanged.connect(self._on_vec_change)
+        gv.addWidget(self.show_vec_cb)
+        vbox.addWidget(grp_vis)
+
+        self.curv_msg_lbl = QLabel(
+            "Tip: select a contour row then click 'Select contour'."
+        )
+        self.curv_msg_lbl.setWordWrap(True)
+        self.curv_msg_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
+        vbox.addWidget(self.curv_msg_lbl)
+        vbox.addStretch()
+
+    # ── Method visibility ─────────────────────────────────────────────────────
+
+    def _update_method_frames(self):
+        m = self.method_cb.currentText()
+        self.grp_thresh.setVisible(m in ("Binary Threshold", "Inv. Binary Threshold"))
+        self.grp_canny.setVisible(m == "Canny Edge")
+
+    # ── Preprocessing helpers ─────────────────────────────────────────────────
+
+    def _current_pre_params(self, frame_idx: Optional[int] = None) -> PreprocessParams:
+        if frame_idx is None:
+            frame_idx = self.detector.current_frame_idx
+        alpha = self.pre_alpha_sl.get_value()
+        beta = int(self.pre_beta_sl.get_value())
+        if frame_idx in self.frame_pre_params:
+            alpha, beta = self.frame_pre_params[frame_idx]
+        k = int(self.pre_blur_sl.get_value())
+        if k % 2 == 0:
+            k += 1
+        k = max(1, k)
+        return PreprocessParams(
+            invert=self.pre_invert_cb.isChecked(),
+            alpha=float(alpha),
+            beta=int(beta),
+            blur_ksize=k,
+        )
+
+    def _get_detect_params(self) -> DetectParams:
+        max_area = int(self.max_area_sl.get_value())
+        max_area_val = max_area if max_area > 0 else None
+        k = int(self.det_blur_sl.get_value())
+        if k % 2 == 0:
+            k += 1
+        k = max(1, k)
+        return DetectParams(
+            method=self.method_cb.currentText(),
+            blur_ksize=k,
+            thresh_value=int(self.thresh_sl.get_value()),
+            canny_low=int(self.canny_low_sl.get_value()),
+            canny_high=int(self.canny_high_sl.get_value()),
+            use_morphology=self.use_morph_cb.isChecked(),
+            morph_ksize=int(self.morph_ksize_sl.get_value()),
+            min_area=int(self.min_area_sl.get_value()),
+            max_area=max_area_val,
+            contour_color=(0, 255, 0),
+            bbox_color=(255, 0, 0),
+            centroid_color=(0, 0, 255),
+            thickness=int(self.thickness_sl.get_value()),
+            draw_bbox=self.draw_bbox_cb.isChecked(),
+            draw_centroid=self.draw_centroid_cb.isChecked(),
+            draw_labels=self.draw_labels_cb.isChecked(),
+        )
+
+    def _reset_pre_defaults(self):
+        self.pre_invert_cb.setChecked(False)
+        self.pre_alpha_sl.set_value(1.0)
+        self.pre_beta_sl.set_value(0)
+        self.pre_blur_sl.set_value(5)
+        self._on_pre_change()
+
+    def _apply_peak_normalization(self):
+        if not self.detector.frames:
+            QMessageBox.warning(self, "No image", "Open an image first.")
+            return
+        target = self.peak_target_sb.value()
+        n = self.detector.num_frames
+        k = int(self.pre_blur_sl.get_value())
+        if k % 2 == 0:
+            k += 1
+        k = max(1, k)
+        invert = self.pre_invert_cb.isChecked()
+        beta = int(self.pre_beta_sl.get_value())
+        # Base preprocessing: invert + blur only (alpha=1, beta=0) to find raw peak
+        base_pre = PreprocessParams(invert=invert, alpha=1, beta=0, blur_ksize=k)
+        orig_idx = self.detector.current_frame_idx
+        applied = 0
+        for i in range(n):
+            self.detector.set_frame(i)
+            gray = self.detector.get_preprocessed_gray(base_pre)
+            hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
+            hist[0] = 0  # ignore background
+            peak = int(np.argmax(hist))
+            if peak <= 0:
+                continue
+            alpha = float(target) / float(peak)
+            self.frame_pre_params[i] = (alpha, beta)
+            self.detector.cache.pop(i, None)
+            applied += 1
+        self.detector.set_frame(orig_idx)
+        self._active_pre_key = None
+        self.peak_norm_lbl.setText(
+            f"Applied to {applied}/{n} frames — target peak: {target}"
+        )
+        self._render_pre_preview()
+        if self.detector.original is not None:
+            pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+            self._update_histogram(pre_gray)
+        self.statusBar().showMessage(
+            f"Peak normalization done — target {target} — {applied}/{n} frame(s) updated."
+        )
+
+    def _on_pre_change(self):
+        if self.detector.frames:
+            idx = self.detector.current_frame_idx
+            self.frame_pre_params[idx] = (
+                self.pre_alpha_sl.get_value(), int(self.pre_beta_sl.get_value())
+            )
+        self.detector.cache.clear()
+        self.selected_contour_index = None
+        self._populate_table([])
+        self._update_frame_ui()
+        self._active_pre_key = None
+        self._render_pre_preview()
+        if self.detector.original is not None:
+            pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+            self._update_histogram(pre_gray)
+
+    def _render_pre_preview(self):
+        if self.detector.original is None:
+            self.pre_preview.setText("Open an image first")
+            self.pre_msg_lbl.setText("Open an image to preview preprocessing.")
+            return
+        try:
+            gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+            pil = cv_to_pil_rgb(gray)
+            arr = __import__("numpy").array(pil)
+            h, w = arr.shape[:2]
+            qimg = QImage(arr.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
+            pm = QPixmap.fromImage(qimg)
+            pw = self.pre_preview.width() or 320
+            ph = self.pre_preview.height() or 180
+            self.pre_preview.setPixmap(
+                pm.scaled(pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+            self.pre_msg_lbl.setText("Live preview — changes applied instantly.")
+        except Exception as e:
+            self.pre_msg_lbl.setText(f"Preview error: {e}")
+
+    def _apply_preprocessing_all_frames(self):
+        n = self.detector.num_frames
+        if n <= 0:
+            return
+        pre = self._current_pre_params()
+        if n >= 15:
+            prog = QProgressDialog(
+                "Preprocessing all frames…", None, 0, n, self
+            )
+            prog.setWindowTitle("Preprocessing")
+            prog.setWindowModality(Qt.WindowModal)
+            prog.setValue(0)
+            prog.show()
+        else:
+            prog = None
+
+        current_idx = self.detector.current_frame_idx
+        try:
+            for i in range(n):
+                self.detector.set_frame(i)
+                self.detector.get_preprocessed_gray(self._current_pre_params(i))
+                if prog:
+                    prog.setValue(i + 1)
+                    QApplication.processEvents()
+        finally:
+            self.detector.set_frame(current_idx)
+            if prog:
+                prog.close()
+
+        self.statusBar().showMessage(
+            f"Preprocessing cached for all {n} frames."
+        )
+
+    # ── Tab changed ───────────────────────────────────────────────────────────
+
+    def _on_tab_changed(self, idx: int):
+        tab_text = self.nb.tabText(idx)
+        if tab_text != "Contour":
+            return
+        if self.detector.num_frames == 0:
+            return
+        pre = self._current_pre_params()
+        pre_key = hash(pre)
+        if self._active_pre_key != pre_key:
+            self.detector.cache.clear()
+            self.selected_contour_index = None
+            self._populate_table([])
+            self._update_frame_ui()
+            self.statusBar().showMessage(
+                "Preprocessing changed — detections cleared."
+            )
+        self._apply_preprocessing_all_frames()
+        self._active_pre_key = pre_key
+        self._refresh_view()
+
+    # ── View helpers ──────────────────────────────────────────────────────────
+
+    def _get_base_cv(self) -> Optional[np.ndarray]:
+        if self.detector.original is None:
+            return None
+        if self.current_view == "preprocessed":
+            try:
+                return self.detector.get_preprocessed_gray(self._current_pre_params())
+            except Exception:
+                pass
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if self.current_view == "binary":
+            return cached["binary"] if cached else None
+        if self.current_view == "contours":
+            return cached["annotated"] if cached else None
+        # default: preprocessed
+        try:
+            return self.detector.get_preprocessed_gray(self._current_pre_params())
+        except Exception:
+            return None
+
+    def _refresh_view(self):
+        cv_img = self._get_base_cv()
+        self.canvas.set_image(cv_img)
+
+        # Contour overlays
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        self.canvas.contours = cached["contours"] if cached else []
+        self.canvas.selected_contour_idx = self.selected_contour_index
+
+        # Histogram
+        self._update_histogram(cv_img)
+
+    def _update_histogram(self, cv_img: Optional[np.ndarray]):
+        if cv_img is None:
+            self.histogram.set_data(None)
+            return
+        if cv_img.dtype == np.uint16:
+            hr = [0, 65536]
+            rmax = 65536.0
+        elif cv_img.dtype == np.uint8:
+            hr = [0, 256]
+            rmax = 256.0
+        else:
+            mx = float(cv_img.max()) + 1
+            hr = [0, max(256.0, mx)]
+            rmax = hr[1]
+            cv_img = cv_img.astype(np.float32)
+
+        if cv_img.ndim == 2:
+            hist = cv2.calcHist([cv_img], [0], None, [256], hr)
+            data = {"gray": hist.flatten()}
+        else:
+            gray_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+            hist = cv2.calcHist([gray_img], [0], None, [256], hr)
+            data = {"gray": hist.flatten()}
+        self.histogram.set_data(data, rmax)
+
+    def set_view(self, view: str):
+        if self.detector.original is None:
+            return
+        if view in ("binary", "contours"):
+            if not self.detector.cache.get(self.detector.current_frame_idx):
+                QMessageBox.information(
+                    self, "Info", "Run detection first to generate this view."
+                )
+                return
+        self.current_view = view
+        labels = {
+            "preprocessed": "View: Preprocessed",
+            "binary": "View: Binary Mask",
+        }
+        if view == "contours":
+            c = len(self.detector.cache[
+                self.detector.current_frame_idx]["contours"])
+            self.view_label.setText(f"View: Contours  ({c})")
+        else:
+            self.view_label.setText(labels.get(view, "View: ?"))
+        self._refresh_view()
+
+    def fit_to_view(self):
+        self.canvas.fit_to_view()
+
+    # ── Open / Detect / Save ──────────────────────────────────────────────────
+
+    def open_image(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open image", "",
+            "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*.*)",
+        )
+        if not path:
+            return
+        try:
+            self.detector.load(path)
+            self.frame_pre_params.clear()
+
+            self.current_view = "preprocessed"
+            self.selected_contour_index = None
+            self.curv.clear()
+            self._active_pre_key = None
+            self.canvas.curve_data = None
+            self.canvas.points_x = []
+            self.canvas.points_y = []
+            self.canvas.contours = []
+            self.canvas.selected_contour_idx = None
+
+            self._update_frame_ui()
+            self._populate_table([])
+
+            self._render_pre_preview()
+            self.view_label.setText("View: Preprocessed")
+            pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+            self.canvas.set_image(pre_gray)
+            self.canvas.fit_to_view()
+            self._update_histogram(pre_gray)
+
+            orig = self.detector.original
+            shape = orig.shape
+            ch = shape[2] if orig.ndim == 3 else 1
+            self.statusBar().showMessage(
+                f"Loaded: {Path(path).name} | Frames: {self.detector.num_frames} | "
+                f"Size: {shape[1]}×{shape[0]} | Dtype: {orig.dtype} | Channels: {ch}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Open error", str(e))
+
+    def detect_current(self):
+        if self.detector.original is None:
+            QMessageBox.warning(self, "No image", "Open an image first.")
+            return
+        try:
+            params = self._get_detect_params()
+            pre = self._current_pre_params()
+            res = self.detector.detect(params, pre)
+            self._populate_table(res["properties"])
+            self.set_view("contours")
+            self._update_frame_ui()
+            self.statusBar().showMessage(
+                f"Frame {self.detector.current_frame_idx + 1}: "
+                f"{len(res['contours'])} contour(s) detected."
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Detection error", str(e))
+
+    def detect_all(self):
+        if self.detector.original is None:
+            QMessageBox.warning(self, "No image", "Open an image first.")
+            return
+        n = self.detector.num_frames
+        if n > 20:
+            ans = QMessageBox.question(
+                self, "Confirm", f"Run detection on all {n} frames?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
+        params = self._get_detect_params()
+        orig_idx = self.detector.current_frame_idx
+
+        prog = QProgressDialog(
+            "Detecting contours on all frames…", "Cancel", 0, n, self
+        )
+        prog.setWindowTitle("Processing")
+        prog.setWindowModality(Qt.WindowModal)
+
+        total = 0
+        try:
+            for i in range(n):
+                if prog.wasCanceled():
+                    break
+                self.detector.set_frame(i)
+                pre = self._current_pre_params(i)
+                r = self.detector.detect(params, pre)
+                total += len(r["contours"])
+                prog.setValue(i + 1)
+                prog.setLabelText(
+                    f"Frame {i + 1} / {n}  —  {len(r['contours'])} contour(s)"
+                )
+                QApplication.processEvents()
+        except Exception as e:
+            prog.close()
+            QMessageBox.critical(self, "Detection error", str(e))
+            self.detector.set_frame(orig_idx)
+            self._update_frame_ui()
+            return
+
+        prog.close()
+        self.detector.set_frame(orig_idx)
+        self._update_frame_ui()
+        self.set_view("contours")
+        QMessageBox.information(
+            self, "Done",
+            f"Detection complete on {n} frames.\nTotal contours: {total}",
+        )
+        self.statusBar().showMessage(f"All frames processed — total contours: {total}")
+
+    # ── Frame navigation ──────────────────────────────────────────────────────
+
+    def _update_frame_ui(self):
+        n = self.detector.num_frames
+        idx = self.detector.current_frame_idx
+        if n <= 0:
+            self.frame_slider.setRange(0, 0)
+            self.frame_slider.setValue(0)
+            self.frame_info_lbl.setText("No image loaded")
+            self.detect_info_lbl.setText("")
+            return
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, max(0, n - 1))
+        self.frame_slider.setValue(idx)
+        self.frame_slider.blockSignals(False)
+        self.frame_info_lbl.setText(f"Frame {idx + 1} / {n}")
+        self.frame_entry.setText(str(idx + 1))
+        cached = self.detector.cache.get(idx)
+        self.detect_info_lbl.setText(
+            f"Done: {len(cached['contours'])} contour(s)" if cached else "Not detected"
+        )
+
+    def _on_frame_slider(self, val: int):
+        if not self.detector.frames:
+            return
+        if val != self.detector.current_frame_idx:
+            self.go_to_frame(val)
+
+    def _on_frame_entry(self):
+        if not self.detector.frames:
+            return
+        try:
+            idx = int(self.frame_entry.text()) - 1
+        except ValueError:
+            return
+        self.go_to_frame(idx)
+
+    def go_to_frame(self, idx: int):
+        if not self.detector.frames:
+            return
+        idx = max(0, min(idx, self.detector.num_frames - 1))
+        self.detector.set_frame(idx)
+
+        # Restore per-frame pre params
+        if idx in self.frame_pre_params:
+            alpha, beta = self.frame_pre_params[idx]
+            self.pre_alpha_sl.set_value(alpha)
+            self.pre_beta_sl.set_value(beta)
+
+        self.curv.clear()
+        self.canvas.curve_data = None
+        self.canvas.points_x = []
+        self.canvas.points_y = []
+        self.selected_contour_index = None
+
+        cached = self.detector.cache.get(idx)
+        if cached is None and self.current_view in ("contours", "binary"):
+            self.current_view = "preprocessed"
+            self.view_label.setText("View: Preprocessed")
+            
+        if cached is not None and "curve_data" in cached:
+            self.canvas.curve_data = cached["curve_data"]
+            self.canvas.points_x = cached.get("curve_points_x", [])
+            self.canvas.points_y = cached.get("curve_points_y", [])
+            self.curv.set_points(self.canvas.points_x, self.canvas.points_y)
+            self.curv.curve_data = self.canvas.curve_data
+            self.selected_contour_index = cached.get("selected_contour_index", None)
+
+        self._render_pre_preview()
+        self._update_frame_ui()
+        self._populate_table([] if cached is None else cached["properties"])
+        self._refresh_view()
+
+    def prev_frame(self):
+        self.go_to_frame(self.detector.current_frame_idx - 1)
+
+    def next_frame(self):
+        self.go_to_frame(self.detector.current_frame_idx + 1)
+
+    # ── Table ─────────────────────────────────────────────────────────────────
+
+    def _populate_table(self, props: List[Dict]):
+        self.table.setRowCount(0)
+        for i, p in enumerate(props):
+            self.table.insertRow(i)
+            cx, cy = p["centroid"]
+            x, y, w, h = p["bbox"]
+            vals = [
+                str(i + 1), str(p["area"]), str(p["perimeter"]),
+                f"({cx},{cy})", f"({x},{y},{w},{h})",
+                str(p["circularity"]), str(p["aspect_ratio"]), str(p["solidity"]),
+            ]
+            for j, v in enumerate(vals):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(i, j, item)
+
+    def _on_table_select(self):
+        rows = self.table.selectedItems()
+        if not rows:
+            self.selected_contour_index = None
+        else:
+            self.selected_contour_index = self.table.currentRow()
+        self.canvas.selected_contour_idx = self.selected_contour_index
+        self.canvas.update()
+
+    # ── Curvature actions ─────────────────────────────────────────────────────
+
+    def _on_draw_enabled(self, state: int):
+        enabled = bool(state)
+        self.canvas.draw_enabled = enabled
+        self.curv_msg_lbl.setText(
+            "Left-drag to draw a curve on the image."
+            if enabled else "Manual drawing disabled."
+        )
+
+    def _on_canvas_points(self, xs: list, ys: list):
+        self.curv.set_points(xs, ys)
+
+    def _on_vec_change(self):
+        self.canvas.show_vectors = self.show_vec_cb.isChecked()
+        self.canvas.vec_density = int(self.vec_density_sl.get_value())
+        self.canvas.vec_len = float(self.vec_len_sl.get_value())
+        self.canvas.update()
+
+    def use_selected_contour(self):
+        if self.selected_contour_index is None:
+            QMessageBox.information(
+                self, "Select a contour",
+                "Select a contour row in the table first."
+            )
+            return
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached:
+            QMessageBox.information(self, "No contours", "Run detection first.")
+            return
+        contours = cached["contours"]
+        idx = self.selected_contour_index
+        if idx < 0 or idx >= len(contours):
+            return
+        pts = contours[idx].reshape(-1, 2)
+        if len(pts) < 10:
+            QMessageBox.information(
+                self, "Too small",
+                "Selected contour has too few points."
+            )
+            return
+        xs = pts[:, 0].astype(float).tolist()
+        ys = pts[:, 1].astype(float).tolist()
+        self.curv.set_points(xs, ys)
+        self.canvas.points_x = xs
+        self.canvas.points_y = ys
+        self.curv_msg_lbl.setText(
+            f"Loaded contour #{idx + 1}  ({len(pts)} pts). "
+            "Click 'Compute Curvature'."
+        )
+        self.canvas.update()
+
+    def use_largest_contour(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached or not cached["contours"]:
+            QMessageBox.information(self, "No contours", "Run detection first.")
+            return
+        contours = cached["contours"]
+        idx = int(np.argmax([cv2.contourArea(c) for c in contours]))
+        self.selected_contour_index = idx
+        self.table.selectRow(idx)
+        self.use_selected_contour()
+
+    def clear_curvature(self):
+        self.curv.clear()
+        self.canvas.curve_data = None
+        self.canvas.points_x = []
+        self.canvas.points_y = []
+        self.show_vec_cb.setChecked(False)
+        self.canvas.show_vectors = False
+        self.curv_msg_lbl.setText("Cleared. Select a contour or draw manually.")
+        self.canvas.update()
+
+    def compute_curvature(self):
+        try:
+            data = self.curv.compute(
+                smooth=float(self.smooth_sl.get_value()),
+                res_mult=float(self.res_sl.get_value()),
+            )
+            self.canvas.curve_data = data
+            
+            # Cache it for the current frame
+            idx = self.detector.current_frame_idx
+            cached = self.detector.cache.get(idx)
+            if cached is not None:
+                cached["curve_data"] = data
+                cached["curve_points_x"] = list(self.canvas.points_x)
+                cached["curve_points_y"] = list(self.canvas.points_y)
+                cached["selected_contour_index"] = self.selected_contour_index
+
+            self.curv_msg_lbl.setText(
+                "Curvature computed. Hover near the curve to inspect R and k."
+            )
+            self.canvas.update()
+        except Exception as e:
+            QMessageBox.critical(self, "Curvature error", str(e))
+
+    def compute_curvature_all(self):
+        n = self.detector.num_frames
+        if n == 0:
+            return
+
+        smooth_val = float(self.smooth_sl.get_value())
+        res_mult_val = float(self.res_sl.get_value())
+
+        prog = QProgressDialog("Computing curvature for all frames...", "Cancel", 0, n, self)
+        prog.setWindowTitle("Processing")
+        prog.setWindowModality(Qt.WindowModal)
+
+        orig_idx = self.detector.current_frame_idx
+        success_count = 0
+
+        for i in range(n):
+            if prog.wasCanceled():
+                break
+            cached = self.detector.cache.get(i)
+            if not cached or not cached.get("contours"):
+                # You might auto-detect here if desired, but for now we skip frames without contours
+                continue
+
+            contours = cached["contours"]
+            # Find largest contour
+            largest_idx = int(np.argmax([cv2.contourArea(c) for c in contours]))
+            pts = contours[largest_idx].reshape(-1, 2)
+            if len(pts) < 10:
+                continue
+
+            xs = pts[:, 0].astype(float).tolist()
+            ys = pts[:, 1].astype(float).tolist()
+            
+            # Temporary curvature engine to not mess up current UI state until end
+            from .curvature import CurvatureEngine
+            temp_curv = CurvatureEngine()
+            temp_curv.set_points(xs, ys)
+            try:
+                data = temp_curv.compute(smooth=smooth_val, res_mult=res_mult_val)
+                cached["curve_data"] = data
+                cached["curve_points_x"] = xs
+                cached["curve_points_y"] = ys
+                cached["selected_contour_index"] = largest_idx
+                success_count += 1
+            except Exception:
+                pass
+
+            prog.setValue(i + 1)
+            QApplication.processEvents()
+
+        prog.close()
+        
+        # Refresh current frame
+        self.go_to_frame(orig_idx)
+        QMessageBox.information(
+            self, "Done", f"Curvature computed for {success_count} frames."
+        )
+
+    # ── Save / Export ─────────────────────────────────────────────────────────
+
+    def save_annotated(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached:
+            QMessageBox.warning(self, "Nothing to save", "Run detection first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save annotated image", "",
+            "PNG (*.png);;TIFF (*.tiff);;JPEG (*.jpg)"
+        )
+        if path:
+            cv2.imwrite(path, cached["annotated"])
+            self.statusBar().showMessage(f"Saved: {path}")
+
+    def save_binary(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached:
+            QMessageBox.warning(self, "Nothing to save", "Run detection first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save binary mask", "", "PNG (*.png);;TIFF (*.tiff)"
+        )
+        if path:
+            cv2.imwrite(path, cached["binary"])
+            self.statusBar().showMessage(f"Saved: {path}")
+
+    def save_curvature_image(self):
+        data = self.curv.curve_data
+        if data is None:
+            QMessageBox.warning(self, "Nothing to save", "Compute curvature first.")
+            return
+        base_cv = self._get_base_cv()
+        if base_cv is None:
+            QMessageBox.warning(self, "No image", "No image is currently loaded.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save curvature image", "",
+            "PNG (*.png);;TIFF (*.tiff);;JPEG (*.jpg)"
+        )
+        if not path:
+            return
+        img = cv2.cvtColor(base_cv, cv2.COLOR_GRAY2BGR) if base_cv.ndim == 2 else base_cv.copy()
+        xs, ys = data["x"], data["y"]
+        pts = np.vstack((xs, ys)).T.astype(np.int32)
+        cv2.polylines(img, [pts], False, (255, 255, 0), 2)
+        if self.show_vec_cb.isChecked():
+            step = int(self.vec_density_sl.get_value())
+            vlen = float(self.vec_len_sl.get_value())
+            tx, ty = data["tx"], data["ty"]
+            nx_a, ny_a = data["nx"], data["ny"]
+            for i in range(0, len(xs), step):
+                vx, vy = float(xs[i]), float(ys[i])
+                t1 = (int(vx - tx[i] * vlen), int(vy - ty[i] * vlen))
+                t2 = (int(vx + tx[i] * vlen), int(vy + ty[i] * vlen))
+                cv2.line(img, t1, t2, (255, 0, 255), 1, cv2.LINE_AA)
+                n2 = (int(vx + nx_a[i] * vlen), int(vy + ny_a[i] * vlen))
+                cv2.arrowedLine(img, (int(vx), int(vy)), n2,
+                                (0, 255, 255), 1, cv2.LINE_AA, 0, 0.2)
+        cv2.imwrite(path, img)
+        self.statusBar().showMessage(f"Saved: {path}")
+
+    def export_csv_current(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached or not cached["properties"]:
+            QMessageBox.warning(self, "No data", "No properties to export for this frame.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export CSV (current frame)", "", "CSV (*.csv)"
+        )
+        if path:
+            self._write_csv(path, {self.detector.current_frame_idx: cached["properties"]})
+            self.statusBar().showMessage(f"Exported CSV: {path}")
+
+    def export_csv_all(self):
+        if not self.detector.cache:
+            QMessageBox.warning(self, "No data", "No detection results to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export CSV (all frames)", "", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        frame_props = {fi: r["properties"] for fi, r in self.detector.cache.items()
+                       if r.get("properties")}
+        if not frame_props:
+            QMessageBox.warning(self, "No data", "No frames have contour properties.")
+            return
+        self._write_csv(path, frame_props)
+        total = sum(len(v) for v in frame_props.values())
+        self.statusBar().showMessage(f"Exported {total} contours to CSV: {path}")
+
+    @staticmethod
+    def _write_csv(path: str, frame_props: Dict[int, List[Dict]]):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Frame", "Contour_ID", "Area", "Perimeter",
+                        "Centroid_X", "Centroid_Y",
+                        "BBox_X", "BBox_Y", "BBox_W", "BBox_H",
+                        "Circularity", "Aspect_Ratio", "Solidity"])
+            for fi in sorted(frame_props):
+                for i, p in enumerate(frame_props[fi], 1):
+                    cx, cy = p["centroid"]
+                    bx, by, bw, bh = p["bbox"]
+                    w.writerow([fi + 1, i, p["area"], p["perimeter"],
+                                cx, cy, bx, by, bw, bh,
+                                p["circularity"], p["aspect_ratio"], p["solidity"]])
+
+    def export_contours_current(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached or not cached.get("contours"):
+            QMessageBox.warning(self, "No data", "No contours to export for this frame.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Contours (current frame)", "", "CSV (*.csv)"
+        )
+        if path:
+            self._write_contours_csv(
+                path, {self.detector.current_frame_idx: cached["contours"]}
+            )
+            self.statusBar().showMessage(f"Exported contours: {path}")
+
+    def export_contours_all(self):
+        if not self.detector.cache:
+            QMessageBox.warning(self, "No data", "No detection results to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Contours (all frames)", "", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        frame_contours = {fi: r["contours"] for fi, r in self.detector.cache.items()
+                          if r.get("contours")}
+        if not frame_contours:
+            QMessageBox.warning(self, "No data", "No frames have contours.")
+            return
+        self._write_contours_csv(path, frame_contours)
+        self.statusBar().showMessage(f"Exported contours to CSV: {path}")
+
+    @staticmethod
+    def _write_contours_csv(path: str, frame_contours: Dict[int, List[np.ndarray]]):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Frame", "Contour_ID", "Point_Index", "X", "Y"])
+            for fi in sorted(frame_contours):
+                for i, cnt in enumerate(frame_contours[fi], 1):
+                    pts = cnt.reshape(-1, 2)
+                    for j, (x, y) in enumerate(pts):
+                        w.writerow([fi + 1, i, j, x, y])
+
+    def export_curvature_current(self):
+        cached = self.detector.cache.get(self.detector.current_frame_idx)
+        if not cached or "curve_data" not in cached:
+            QMessageBox.warning(self, "No data", "No curvature data to export for this frame.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Curvature (current frame)", "", "CSV (*.csv)"
+        )
+        if path:
+            self._write_curvature_csv(
+                path, {self.detector.current_frame_idx: cached["curve_data"]}
+            )
+            self.statusBar().showMessage(f"Exported curvature: {path}")
+
+    def export_curvature_all(self):
+        if not self.detector.cache:
+            QMessageBox.warning(self, "No data", "No detection results to export.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Curvature (all frames)", "", "CSV (*.csv)"
+        )
+        if not path:
+            return
+        frame_curves = {fi: r["curve_data"] for fi, r in self.detector.cache.items()
+                        if "curve_data" in r}
+        if not frame_curves:
+            QMessageBox.warning(self, "No data", "No frames have curvature data.")
+            return
+        self._write_curvature_csv(path, frame_curves)
+        self.statusBar().showMessage(f"Exported curvature to CSV: {path}")
+
+    @staticmethod
+    def _write_curvature_csv(path: str, frame_curves: Dict[int, Dict[str, np.ndarray]]):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["Frame", "Point_Index", "X", "Y", "Curvature_k", "Radius_R", "Tangent_X", "Tangent_Y", "Normal_X", "Normal_Y"])
+            for fi in sorted(frame_curves):
+                data = frame_curves[fi]
+                for j in range(len(data["x"])):
+                    w.writerow([
+                        fi + 1, j, 
+                        data["x"][j], data["y"][j],
+                        data["k"][j], data["r"][j],
+                        data["tx"][j], data["ty"][j],
+                        data["nx"][j], data["ny"][j]
+                    ])
+
+    # ── About ─────────────────────────────────────────────────────────────────
+
+    def _about(self):
+        QMessageBox.information(
+            self, "About – Tip Curvature Analyzer v2",
+            "TIFF Contour + Curvature Analyzer\n\n"
+            "• Preprocessing tab – live contrast/blur preview\n"
+            "• Contour tab – multiple threshold methods, CSV export\n"
+            "• Curvature tab – spline fitting, hover inspection\n\n"
+            "Keyboard shortcuts:\n"
+            "  Ctrl+O  Open image\n"
+            "  Ctrl+S  Save annotated\n"
+            "  F       Fit to view\n"
+            "  ←/→     Navigate frames\n\n"
+            "Canvas controls:\n"
+            "  Scroll wheel  Zoom\n"
+            "  Right-drag    Pan\n"
+            "  Left-drag     Draw (when enabled)\n"
+        )
+
+
+# ── Application entry point ──────────────────────────────────────────────────
+
+def run():
+    import sys
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyleSheet(DARK_QSS)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())

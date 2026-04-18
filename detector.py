@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -19,6 +19,7 @@ class ContourDetector:
         self.current_frame_idx: int = 0
         self.image_path: Optional[str] = None
         self.original: Optional[np.ndarray] = None
+        self.rotation_angle: float = 0.0
 
         # pre_cache[frame_idx][pre_key] = gray_preprocessed_uint8
         self.pre_cache: Dict[int, Dict[int, np.ndarray]] = {}
@@ -38,6 +39,30 @@ class ContourDetector:
         self.frames = load_frames(path)
         if not self.frames:
             raise ValueError("No frames found.")
+        self.rotation_angle = 0.0
+        self.pre_cache.clear()
+        self.cache.clear()
+        self.set_frame(0)
+
+    def load_paths(self, paths: Sequence[str]):
+        if not paths:
+            raise ValueError("No images selected.")
+        frames: List[np.ndarray] = []
+        used: List[str] = []
+        for p in paths:
+            cur = load_frames(str(p))
+            if not cur:
+                continue
+            frames.extend(cur)
+            used.append(str(p))
+        if not frames:
+            raise ValueError("No frames found.")
+        if len(used) == 1:
+            self.image_path = used[0]
+        else:
+            self.image_path = f"{used[0]} (+{len(used) - 1} files)"
+        self.frames = frames
+        self.rotation_angle = 0.0
         self.pre_cache.clear()
         self.cache.clear()
         self.set_frame(0)
@@ -47,7 +72,68 @@ class ContourDetector:
             return
         idx = max(0, min(idx, self.num_frames - 1))
         self.current_frame_idx = idx
-        self.original = self.frames[idx]
+        raw_frame = self.frames[idx]
+        if abs(self.rotation_angle) > 1e-7:
+            self.original = self._rotate_image_any(raw_frame, self.rotation_angle)
+        else:
+            self.original = raw_frame
+
+    def rotate_stack(self, quarter_turns: int):
+        """Rotate all frames by 90-degree steps (positive = CCW, negative = CW)."""
+        if not self.frames:
+            return
+        k = int(quarter_turns) % 4
+        if k == 0:
+            return
+        self.frames = [np.ascontiguousarray(np.rot90(f, k=k)) for f in self.frames]
+        self.pre_cache.clear()
+        self.cache.clear()
+        self.set_frame(self.current_frame_idx)
+
+    @staticmethod
+    def _rotate_image_any(img: np.ndarray, angle_deg: float) -> np.ndarray:
+        h, w = img.shape[:2]
+        cx, cy = w * 0.5, h * 0.5
+        m = cv2.getRotationMatrix2D((cx, cy), float(angle_deg), 1.0)
+
+        c = abs(m[0, 0])
+        s = abs(m[0, 1])
+        new_w = max(1, int(round(h * s + w * c)))
+        new_h = max(1, int(round(h * c + w * s)))
+
+        m[0, 2] += (new_w * 0.5) - cx
+        m[1, 2] += (new_h * 0.5) - cy
+
+        if img.ndim == 2:
+            border = 0
+        elif img.shape[2] == 4:
+            border = (0, 0, 0, 0)
+        else:
+            border = (0, 0, 0)
+
+        out = cv2.warpAffine(
+            img,
+            m,
+            (new_w, new_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=border,
+        )
+        return np.ascontiguousarray(out)
+
+    def rotate_stack_by_angle(self, angle_deg: float):
+        if not self.frames:
+            return
+        a = float(angle_deg)
+        if abs(a) < 1e-7:
+            return
+        self.rotation_angle += a
+        self.rotation_angle = self.rotation_angle % 360.0
+        if self.rotation_angle > 180.0:
+            self.rotation_angle -= 360.0
+        self.pre_cache.clear()
+        self.cache.clear()
+        self.set_frame(self.current_frame_idx)
 
     # ------------------------------------------------------------------
     # Preprocessing
@@ -85,8 +171,9 @@ class ContourDetector:
 
     @staticmethod
     def _props(cnt: np.ndarray) -> Dict:
-        area = float(cv2.contourArea(cnt))
-        peri = float(cv2.arcLength(cnt, True))
+        is_closed = ContourDetector._is_effectively_closed(cnt)
+        area = float(cv2.contourArea(cnt)) if is_closed else 0.0
+        peri = float(cv2.arcLength(cnt, is_closed))
         x, y, w, h = cv2.boundingRect(cnt)
         m = cv2.moments(cnt)
         if m["m00"] != 0:
@@ -95,7 +182,7 @@ class ContourDetector:
         else:
             cx, cy = x + w // 2, y + h // 2
 
-        circ = (4 * math.pi * area / (peri ** 2)) if peri > 0 else 0.0
+        circ = (4 * math.pi * area / (peri ** 2)) if (peri > 0 and is_closed) else 0.0
         ar = (float(w) / h) if h > 0 else 0.0
         hull = cv2.convexHull(cnt)
         hull_area = float(cv2.contourArea(hull))
@@ -110,6 +197,132 @@ class ContourDetector:
             "aspect_ratio": round(ar, 3),
             "solidity": round(sol, 3),
         }
+
+    @staticmethod
+    def _is_effectively_closed(cnt: np.ndarray, tol_px: float = 2.5) -> bool:
+        pts = cnt.reshape(-1, 2).astype(np.float32)
+        if len(pts) < 3:
+            return False
+        return float(np.linalg.norm(pts[0] - pts[-1])) <= float(tol_px)
+
+    @staticmethod
+    def _is_straight_line_contour(cnt: np.ndarray, tol: float) -> bool:
+        """Detect near-linear contours using distance to best-fit line."""
+        pts = cnt.reshape(-1, 2).astype(np.float32)
+        if len(pts) < 8:
+            return False
+
+        vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01)
+        vx, vy = float(vx[0]), float(vy[0])
+        x0, y0 = float(x0[0]), float(y0[0])
+        norm = math.hypot(vx, vy)
+        if norm < 1e-8:
+            return True
+        vx /= norm
+        vy /= norm
+
+        rel = pts - np.array([x0, y0], dtype=np.float32)
+        proj = rel[:, 0] * vx + rel[:, 1] * vy
+        span = float(np.max(proj) - np.min(proj))
+        if span < 8.0:
+            return False
+
+        # 2D cross product magnitude against unit direction = perpendicular distance.
+        perp = np.abs(rel[:, 0] * vy - rel[:, 1] * vx)
+        mean_ratio = float(np.mean(perp) / span)
+        max_ratio = float(np.max(perp) / span)
+
+        cov = np.cov(pts.T)
+        eigvals = np.linalg.eigvalsh(cov)
+        eigvals = np.maximum(eigvals, 0.0)
+        linearity = float(eigvals[0] / max(eigvals[1], 1e-8))
+
+        seg = np.diff(pts, axis=0)
+        path_len = float(np.sum(np.linalg.norm(seg, axis=1)))
+        end_dist = float(np.linalg.norm(pts[-1] - pts[0])) + 1e-8
+        tortuosity = path_len / end_dist
+
+        _, (rw, rh), _ = cv2.minAreaRect(pts.reshape(-1, 1, 2))
+        thinness = float(min(rw, rh))
+        elongation = float(max(rw, rh))
+
+        tol = max(1e-4, float(tol))
+        return (
+            (
+                mean_ratio < (2.5 * tol)
+                and max_ratio < (6.0 * tol)
+                and linearity < 0.015
+                and tortuosity < 1.15
+            )
+            or (elongation > 20.0 and thinness < 2.5)
+        )
+
+    @staticmethod
+    def _split_contour_on_roi_border(
+        cnt: np.ndarray, roi: Tuple[int, int, int, int]
+    ) -> List[np.ndarray]:
+        """Split a contour into open segments, dropping points on ROI border."""
+        rx, ry, rw, rh = roi
+        pts = cnt.reshape(-1, 2)
+        if len(pts) < 2:
+            return []
+
+        x0, y0 = int(rx), int(ry)
+        x1, y1 = int(rx + rw - 1), int(ry + rh - 1)
+        on_border = (
+            (pts[:, 0] <= x0) | (pts[:, 0] >= x1) |
+            (pts[:, 1] <= y0) | (pts[:, 1] >= y1)
+        )
+        keep = ~on_border
+        if int(np.count_nonzero(keep)) < 2:
+            return []
+        if not np.any(on_border):
+            return [cnt.astype(np.int32)]
+
+        n = len(pts)
+        first_border = int(np.where(on_border)[0][0])
+        pts_r = np.concatenate((pts[first_border + 1:], pts[:first_border + 1]), axis=0)
+        keep_r = np.concatenate((keep[first_border + 1:], keep[:first_border + 1]), axis=0)
+
+        out: List[np.ndarray] = []
+        i = 0
+        while i < n:
+            if not bool(keep_r[i]):
+                i += 1
+                continue
+            j = i
+            while j < n and bool(keep_r[j]):
+                j += 1
+            seg = pts_r[i:j]
+            if len(seg) >= 2:
+                out.append(seg.reshape(-1, 1, 2).astype(np.int32))
+            i = j
+        return out
+
+    @staticmethod
+    def _extract_contours(
+        binary: np.ndarray,
+        roi: Optional[Tuple[int, int, int, int]],
+    ) -> Tuple[List[np.ndarray], np.ndarray]:
+        if roi is None:
+            contours, _ = cv2.findContours(binary, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+            return contours, binary
+
+        rx, ry, rw, rh = roi
+        view_binary = np.zeros_like(binary)
+        roi_bin = binary[ry:ry + rh, rx:rx + rw].copy()
+        view_binary[ry:ry + rh, rx:rx + rw] = roi_bin
+
+        local_contours, _ = cv2.findContours(roi_bin, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+        out: List[np.ndarray] = []
+        for cnt in local_contours:
+            if cnt.size == 0:
+                continue
+            cnt_g = cnt.copy()
+            cnt_g[:, :, 0] += rx
+            cnt_g[:, :, 1] += ry
+            out.extend(ContourDetector._split_contour_on_roi_border(cnt_g, roi))
+        return out, view_binary
 
     # ------------------------------------------------------------------
     # Drawing
@@ -135,7 +348,10 @@ class ContourDetector:
         else:
             out = ensure_uint8(img).copy()
 
-        cv2.drawContours(out, contours, -1, contour_color, thickness)
+        for cnt in contours:
+            pts = cnt.reshape(-1, 1, 2)
+            cv2.polylines(out, [pts], isClosed=False, color=contour_color,
+                          thickness=thickness, lineType=cv2.LINE_AA)
 
         for i, p in enumerate(props, start=1):
             if draw_bbox:
@@ -157,11 +373,12 @@ class ContourDetector:
     # Detection
     # ------------------------------------------------------------------
 
-    def detect(self, params: DetectParams, pre: PreprocessParams) -> Dict:
+    def detect(self, params: DetectParams, pre: PreprocessParams,
+               roi: Optional[Tuple[int, int, int, int]] = None) -> Dict:
         if self.original is None:
             raise ValueError("No image loaded.")
 
-        combined_key = hash((params, pre))
+        combined_key = hash((params, pre, roi))
         cached = self.cache.get(self.current_frame_idx)
         if cached and cached.get("param_key") == combined_key:
             return cached
@@ -205,15 +422,41 @@ class ContourDetector:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (mk, mk))
             binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        roi_clamped: Optional[Tuple[int, int, int, int]] = None
+        if roi is not None:
+            rx, ry, rw, rh = roi
+            ih, iw = binary.shape[:2]
+            rx, ry = max(0, rx), max(0, ry)
+            rw = max(1, min(rw, iw - rx))
+            rh = max(1, min(rh, ih - ry))
+            roi_clamped = (int(rx), int(ry), int(rw), int(rh))
+
+        contours, binary_view = self._extract_contours(binary, roi_clamped)
 
         filtered: List[np.ndarray] = []
         for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < params.min_area:
-                continue
-            if params.max_area is not None and area > params.max_area:
+            is_closed = self._is_effectively_closed(cnt)
+            area = float(cv2.contourArea(cnt)) if is_closed else 0.0
+            length = float(cv2.arcLength(cnt, is_closed))
+
+            if is_closed:
+                if area < params.min_area:
+                    continue
+                if params.max_area is not None and area > params.max_area:
+                    continue
+            else:
+                min_open_len = max(8.0, 0.25 * float(params.min_area))
+                if length < min_open_len:
+                    continue
+
+            if params.min_rect_width > 0 and is_closed and len(cnt) >= 5:
+                _, (rw, rh), _ = cv2.minAreaRect(cnt)
+                if min(rw, rh) < params.min_rect_width:
+                    continue
+            if (
+                params.reject_straight_lines
+                and self._is_straight_line_contour(cnt, params.straight_line_tol)
+            ):
                 continue
             filtered.append(cnt)
 
@@ -230,7 +473,7 @@ class ContourDetector:
 
         res = {
             "param_key": combined_key,
-            "binary": binary,
+            "binary": binary_view,
             "contours": filtered,
             "properties": props,
             "annotated": annotated,

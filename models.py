@@ -26,6 +26,7 @@ class DetectParams:
     morph_ksize: int
     min_area: int
     max_area: Optional[int]
+    min_rect_width: int    # filter contours whose thinnest dimension < this (0 = off)
     contour_color: Tuple[int, int, int]
     bbox_color: Tuple[int, int, int]
     centroid_color: Tuple[int, int, int]
@@ -33,3 +34,5 @@ class DetectParams:
     draw_bbox: bool
     draw_centroid: bool
     draw_labels: bool
+    reject_straight_lines: bool = True
+    straight_line_tol: float = 0.01  # normalized line-fit deviation (smaller = stricter)

@@ -66,9 +66,11 @@ class CurvatureEngine:
             nx = -dy / norm
             ny = dx / norm
 
-        for arr in (k, r, tx, ty, nx, ny):
+        for arr in (k, tx, ty, nx, ny):
             arr[np.isnan(arr)] = 0.0
             arr[np.isinf(arr)] = 0.0
+        # Preserve infinite radius for flat segments (k == 0).
+        r[np.isnan(r)] = 0.0
 
         self.curve_data = {
             "x": np.asarray(x_fit),

@@ -1,8 +1,11 @@
-"""Main application window – PyQt5 version, no Tkinter."""
+"""Main application window - PyQt5 version, no Tkinter."""
 from __future__ import annotations
 
+import copy
 import csv
 import math
+import re
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -17,7 +20,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QFileDialog, QAction, QFrame, QSizePolicy, QToolBar,
     QSpacerItem, QSpinBox,
 )
-from PyQt5.QtCore import Qt, QPoint, QPointF, QSize, pyqtSignal, QRect
+from PyQt5.QtCore import Qt, QPoint, QPointF, QSize, pyqtSignal, QRect, QRectF
 from PyQt5.QtGui import (
     QPainter, QPixmap, QImage, QColor, QPen, QBrush, QFont,
     QPainterPath, QTransform,
@@ -26,9 +29,9 @@ from PyQt5.QtGui import (
 from .detector import ContourDetector
 from .curvature import CurvatureEngine
 from .models import DetectParams, PreprocessParams
-from .utils import cv_to_pil_rgb, parse_bgr
+from .utils import cv_to_pil_rgb
 
-# ── Colour palette (Catppuccin Mocha-inspired) ───────────────────────────────
+# -- Colour palette (Catppuccin Mocha-inspired) -------------------------------
 _BG      = "#1e1e2e"
 _BG_ALT  = "#181825"
 _PANEL   = "#313244"
@@ -120,7 +123,7 @@ QProgressBar::chunk {{ background: {_ACCENT}; border-radius: 3px; }}
 """
 
 
-# ── Utility ──────────────────────────────────────────────────────────────────
+# -- Utility ------------------------------------------------------------------
 
 def _cv_to_qpixmap(img: np.ndarray) -> QPixmap:
     """Convert an OpenCV BGR/gray/BGRA numpy array to a QPixmap."""
@@ -137,7 +140,7 @@ def _cv_to_qpixmap(img: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(qimg)
 
 
-# ── LabeledSlider ─────────────────────────────────────────────────────────────
+# -- LabeledSlider -------------------------------------------------------------
 
 class LabeledSlider(QWidget):
     """Slider with a label and a live value readout."""
@@ -205,7 +208,7 @@ class LabeledSlider(QWidget):
         self.slider.blockSignals(False)
 
 
-# ── HistogramWidget ───────────────────────────────────────────────────────────
+# -- HistogramWidget -----------------------------------------------------------
 
 class HistogramWidget(QWidget):
     """Custom-painted pixel histogram."""
@@ -287,7 +290,7 @@ class HistogramWidget(QWidget):
             lbl = f"{val//1000}k" if val >= 1000 else str(val)
             painter.drawText(pl - 44, y - 7, 40, 14, Qt.AlignRight | Qt.AlignVCenter, lbl)
 
-        # Channel colours (BGR → display: R G B or gray)
+        # Channel colours (BGR -> display: R G B or gray)
         ch_colors = {
             "gray": QColor("#cccccc"),
             "b": QColor("#5B9BD5"),
@@ -343,7 +346,7 @@ class HistogramWidget(QWidget):
         painter.end()
 
 
-# ── ImageCanvas ──────────────────────────────────────────────────────────────
+# -- ImageCanvas --------------------------------------------------------------
 
 class ImageCanvas(QWidget):
     """Zoomable/pannable image canvas with overlay drawing."""
@@ -351,6 +354,10 @@ class ImageCanvas(QWidget):
     zoom_changed = pyqtSignal(float)
     points_captured = pyqtSignal(list, list)   # xs, ys
     status_message = pyqtSignal(str)
+    roi_changed = pyqtSignal(object)           # QRect in image coords, or None
+    align_line_drawn = pyqtSignal(object)      # (x1, y1, x2, y2) in image coords, or None
+    _ROI_HANDLE_RADIUS_PX = 6
+    _ROI_MIN_SIZE_PX = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -389,6 +396,21 @@ class ImageCanvas(QWidget):
 
         # Hover
         self._hover_data: Optional[Tuple] = None  # (sx, sy, k, r, nx, ny, tx, ty)
+
+        # ROI
+        self.roi_rect: Optional[QRect] = None
+        self.roi_mode: bool = False
+        self._roi_start: Optional[Tuple[float, float]] = None
+        self._roi_temp: Optional[QRect] = None   # in image coords while dragging
+        self._roi_drag_mode: Optional[str] = None
+        self._roi_drag_origin: Optional[Tuple[float, float]] = None
+        self._roi_drag_start_rect: Optional[QRect] = None
+        self.align_mode: bool = False
+        self._align_start: Optional[Tuple[float, float]] = None
+        self._align_end: Optional[Tuple[float, float]] = None
+
+        # Pixel info
+        self._hover_img_pos: Optional[Tuple[int, int]] = None
 
         self.setStyleSheet(f"background: #1a1a2e;")
         self.setMinimumSize(300, 200)
@@ -450,6 +472,8 @@ class ImageCanvas(QWidget):
         painter.resetTransform()
 
         self._paint_selected_contour(painter)
+        self._paint_roi(painter)
+        self._paint_align_line(painter)
         self._paint_points(painter)
         self._paint_curve(painter)
         if self.show_vectors and self.curve_data:
@@ -458,6 +482,7 @@ class ImageCanvas(QWidget):
             self._paint_circle_preview(painter)
         if self._hover_data:
             self._paint_hover(painter)
+        self._paint_pixel_info(painter)
 
         painter.end()
 
@@ -476,10 +501,181 @@ class ImageCanvas(QWidget):
         for x, y in pts[1:]:
             sx, sy = self.to_screen(float(x), float(y))
             path.lineTo(sx, sy)
-        # close
-        sx0, sy0 = self.to_screen(float(pts[0, 0]), float(pts[0, 1]))
-        path.lineTo(sx0, sy0)
         painter.drawPath(path)
+
+    def _paint_roi(self, painter: QPainter):
+        rect_src = self._roi_temp if self._roi_temp is not None else self.roi_rect
+        if rect_src is None:
+            return
+        screen_rect = self._roi_to_screen_rect(rect_src)
+        painter.fillRect(screen_rect, QColor(253, 127, 40, 38))   # orange, 15% opacity
+        pen = QPen(QColor("#fd7f28"), 2, Qt.DashLine)
+        pen.setDashPattern([6, 3])
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(screen_rect)
+        if self._roi_temp is None:
+            handle_r = float(self._ROI_HANDLE_RADIUS_PX)
+            painter.setPen(QPen(QColor("#1a1a2e"), 1))
+            painter.setBrush(QBrush(QColor("#fd7f28")))
+            for pt in self._roi_handle_points_screen(rect_src).values():
+                painter.drawRect(QRectF(pt.x() - handle_r, pt.y() - handle_r,
+                                        2 * handle_r, 2 * handle_r))
+
+    def _paint_align_line(self, painter: QPainter):
+        if self._align_start is None or self._align_end is None:
+            return
+        x1, y1 = self._align_start
+        x2, y2 = self._align_end
+        sx1, sy1 = self.to_screen(float(x1), float(y1))
+        sx2, sy2 = self.to_screen(float(x2), float(y2))
+        pen = QPen(QColor("#89b4fa"), 2, Qt.DashLine)
+        pen.setDashPattern([5, 3])
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawLine(QPointF(sx1, sy1), QPointF(sx2, sy2))
+
+    def _roi_to_screen_rect(self, rect: QRect) -> QRectF:
+        sx1, sy1 = self.to_screen(float(rect.x()), float(rect.y()))
+        sx2, sy2 = self.to_screen(float(rect.x() + rect.width()),
+                                   float(rect.y() + rect.height()))
+        left, right = sorted((sx1, sx2))
+        top, bottom = sorted((sy1, sy2))
+        return QRectF(left, top, right - left, bottom - top)
+
+    def _roi_handle_points_screen(self, rect: QRect) -> Dict[str, QPointF]:
+        sr = self._roi_to_screen_rect(rect)
+        x1, y1 = sr.left(), sr.top()
+        x2, y2 = sr.right(), sr.bottom()
+        cx, cy = (x1 + x2) * 0.5, (y1 + y2) * 0.5
+        return {
+            "tl": QPointF(x1, y1),
+            "t": QPointF(cx, y1),
+            "tr": QPointF(x2, y1),
+            "r": QPointF(x2, cy),
+            "br": QPointF(x2, y2),
+            "b": QPointF(cx, y2),
+            "bl": QPointF(x1, y2),
+            "l": QPointF(x1, cy),
+        }
+
+    def _roi_hit_test(self, sx: float, sy: float) -> Optional[str]:
+        if self.roi_rect is None:
+            return None
+        hit_pad = float(self._ROI_HANDLE_RADIUS_PX) + 2.0
+        handles = self._roi_handle_points_screen(self.roi_rect)
+        for key in ("tl", "tr", "br", "bl", "l", "r", "t", "b"):
+            p = handles[key]
+            if abs(sx - p.x()) <= hit_pad and abs(sy - p.y()) <= hit_pad:
+                return key
+        if self._roi_to_screen_rect(self.roi_rect).contains(QPointF(sx, sy)):
+            return "move"
+        return None
+
+    def _cursor_for_roi_mode(self, mode: Optional[str]):
+        if mode in ("l", "r"):
+            return Qt.SizeHorCursor
+        if mode in ("t", "b"):
+            return Qt.SizeVerCursor
+        if mode in ("tl", "br"):
+            return Qt.SizeFDiagCursor
+        if mode in ("tr", "bl"):
+            return Qt.SizeBDiagCursor
+        if mode == "move":
+            return Qt.SizeAllCursor
+        return Qt.CrossCursor
+
+    def _clamp_roi_rect(self, rect: QRect) -> QRect:
+        if self._cv_img is None:
+            return rect
+        ih, iw = self._cv_img.shape[:2]
+        if iw < 1 or ih < 1:
+            return rect
+
+        x1 = int(np.clip(rect.x(), 0, max(0, iw - 1)))
+        y1 = int(np.clip(rect.y(), 0, max(0, ih - 1)))
+        x2 = int(np.clip(rect.x() + rect.width(), x1 + 1, iw))
+        y2 = int(np.clip(rect.y() + rect.height(), y1 + 1, ih))
+        return QRect(x1, y1, x2 - x1, y2 - y1)
+
+    def _clamp_roi_move(self, x: int, y: int, w: int, h: int) -> QRect:
+        if self._cv_img is None:
+            return QRect(x, y, w, h)
+        ih, iw = self._cv_img.shape[:2]
+        if iw < 1 or ih < 1:
+            return QRect(x, y, w, h)
+        w = max(1, min(int(w), iw))
+        h = max(1, min(int(h), ih))
+        x = int(np.clip(x, 0, max(0, iw - w)))
+        y = int(np.clip(y, 0, max(0, ih - h)))
+        return QRect(x, y, w, h)
+
+    def _roi_drag_rect(self, wx: float, wy: float) -> Optional[QRect]:
+        mode = self._roi_drag_mode
+        start = self._roi_drag_start_rect
+        if mode is None or start is None:
+            return None
+
+        x1, y1 = start.x(), start.y()
+        x2, y2 = x1 + start.width(), y1 + start.height()
+        min_size = int(self._ROI_MIN_SIZE_PX)
+        cx, cy = int(round(wx)), int(round(wy))
+
+        if mode == "move":
+            if self._roi_drag_origin is None:
+                return None
+            ox, oy = self._roi_drag_origin
+            dx, dy = int(round(wx - ox)), int(round(wy - oy))
+            return self._clamp_roi_move(x1 + dx, y1 + dy, start.width(), start.height())
+
+        if "l" in mode:
+            x1 = min(cx, x2 - min_size)
+        if "r" in mode:
+            x2 = max(cx, x1 + min_size)
+        if "t" in mode:
+            y1 = min(cy, y2 - min_size)
+        if "b" in mode:
+            y2 = max(cy, y1 + min_size)
+        return self._clamp_roi_rect(QRect(x1, y1, x2 - x1, y2 - y1))
+
+    def _refresh_pixel_info(self, sx: int, sy: int):
+        if self._cv_img is None:
+            if self._hover_img_pos is not None:
+                self._hover_img_pos = None
+                self.update()
+            return
+        wx, wy = self.to_world(float(sx), float(sy))
+        ih, iw = self._cv_img.shape[:2]
+        ix, iy = int(wx), int(wy)
+        new_pos = (ix, iy) if (0 <= ix < iw and 0 <= iy < ih) else None
+        if new_pos != self._hover_img_pos:
+            self._hover_img_pos = new_pos
+            self.update()
+
+    def _paint_pixel_info(self, painter: QPainter):
+        if self._cv_img is None or self._hover_img_pos is None:
+            return
+        ix, iy = self._hover_img_pos
+        ih, iw = self._cv_img.shape[:2]
+        if not (0 <= ix < iw and 0 <= iy < ih):
+            return
+        img = self._cv_img
+        if img.ndim == 2:
+            text = f"x: {ix}   y: {iy}   |   I: {int(img[iy, ix])}"
+        elif img.ndim >= 3 and img.shape[2] >= 3:
+            b, g, r = int(img[iy, ix, 0]), int(img[iy, ix, 1]), int(img[iy, ix, 2])
+            text = f"x: {ix}   y: {iy}   |   R:{r}  G:{g}  B:{b}"
+        else:
+            return
+        font = QFont("Courier New", 9)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(text) + 16
+        th = fm.height() + 10
+        rx, ry = 6, self.height() - th - 6
+        painter.fillRect(rx, ry, tw, th, QColor(30, 30, 46, 217))
+        painter.setPen(QColor("#cdd6f4"))
+        painter.drawText(rx + 8, ry + th - 6, text)
 
     def _paint_points(self, painter: QPainter):
         if len(self.points_x) < 2:
@@ -610,6 +806,25 @@ class ImageCanvas(QWidget):
             self._panning = True
             self._last_mouse = event.pos()
             self.setCursor(Qt.ClosedHandCursor)
+        elif event.button() == Qt.LeftButton and self.align_mode:
+            wx, wy = self.to_world(event.x(), event.y())
+            self._align_start = (wx, wy)
+            self._align_end = (wx, wy)
+            self.update()
+        elif event.button() == Qt.LeftButton and self.roi_mode:
+            wx, wy = self.to_world(event.x(), event.y())
+            self._roi_start = (wx, wy)
+            self._roi_temp = None
+            self.update()
+        elif event.button() == Qt.LeftButton and self.roi_rect is not None and not self.draw_enabled:
+            hit = self._roi_hit_test(float(event.x()), float(event.y()))
+            if hit is not None:
+                wx, wy = self.to_world(event.x(), event.y())
+                self._roi_drag_mode = hit
+                self._roi_drag_origin = (wx, wy)
+                self._roi_drag_start_rect = QRect(self.roi_rect)
+                self.setCursor(self._cursor_for_roi_mode(hit))
+                self.update()
         elif event.button() == Qt.LeftButton and self.draw_enabled:
             self._is_drawing = True
             wx, wy = self.to_world(event.x(), event.y())
@@ -630,6 +845,37 @@ class ImageCanvas(QWidget):
             self._last_mouse = event.pos()
             self.update()
             return
+
+        if self.roi_mode and self._roi_start is not None:
+            wx, wy = self.to_world(event.x(), event.y())
+            x0, y0 = self._roi_start
+            ix, iy = int(min(x0, wx)), int(min(y0, wy))
+            iw, ih = int(abs(wx - x0)), int(abs(wy - y0))
+            self._roi_temp = QRect(ix, iy, iw, ih)
+            self.update()
+            return
+
+        if self.align_mode and self._align_start is not None:
+            wx, wy = self.to_world(event.x(), event.y())
+            self._align_end = (wx, wy)
+            self.setCursor(Qt.CrossCursor)
+            self.update()
+            return
+
+        if self._roi_drag_mode is not None:
+            wx, wy = self.to_world(event.x(), event.y())
+            new_rect = self._roi_drag_rect(wx, wy)
+            if new_rect is not None:
+                self.roi_rect = new_rect
+                self.update()
+            return
+
+        if self.roi_rect is not None and not self.draw_enabled:
+            self.setCursor(self._cursor_for_roi_mode(
+                self._roi_hit_test(float(event.x()), float(event.y()))
+            ))
+        elif not self._is_drawing:
+            self.setCursor(Qt.CrossCursor)
 
         if self._is_drawing and self.draw_enabled:
             wx, wy = self.to_world(event.x(), event.y())
@@ -663,11 +909,48 @@ class ImageCanvas(QWidget):
         if self._hover_data is not None:
             self._hover_data = None
             self.update()
+        self._refresh_pixel_info(event.x(), event.y())
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.RightButton:
             self._panning = False
             self.setCursor(Qt.CrossCursor)
+        elif event.button() == Qt.LeftButton and self.align_mode and self._align_start is not None:
+            wx, wy = self.to_world(event.x(), event.y())
+            self._align_end = (wx, wy)
+            x0, y0 = self._align_start
+            x1, y1 = self._align_end
+            self.align_mode = False
+            self._align_start = None
+            self._align_end = None
+            self.setCursor(Qt.CrossCursor)
+            if math.hypot(x1 - x0, y1 - y0) > 2.0:
+                self.align_line_drawn.emit((x0, y0, x1, y1))
+            else:
+                self.align_line_drawn.emit(None)
+            self.update()
+        elif event.button() == Qt.LeftButton and self.roi_mode and self._roi_start is not None:
+            wx, wy = self.to_world(event.x(), event.y())
+            x0, y0 = self._roi_start
+            ix, iy = int(min(x0, wx)), int(min(y0, wy))
+            iw, ih = int(abs(wx - x0)), int(abs(wy - y0))
+            if iw > 2 and ih > 2:
+                self.roi_rect = self._clamp_roi_rect(QRect(ix, iy, iw, ih))
+            self._roi_start = None
+            self._roi_temp = None
+            self.roi_mode = False
+            self.setCursor(Qt.CrossCursor)
+            self.roi_changed.emit(self.roi_rect)
+            self.update()
+        elif event.button() == Qt.LeftButton and self._roi_drag_mode is not None:
+            self._roi_drag_mode = None
+            self._roi_drag_origin = None
+            self._roi_drag_start_rect = None
+            self.setCursor(self._cursor_for_roi_mode(
+                self._roi_hit_test(float(event.x()), float(event.y()))
+            ))
+            self.roi_changed.emit(self.roi_rect)
+            self.update()
         elif event.button() == Qt.LeftButton and self._is_drawing:
             self._is_drawing = False
             if self.draw_mode == "circle":
@@ -687,10 +970,10 @@ class ImageCanvas(QWidget):
             self.update()
 
 
-# ── MainWindow ───────────────────────────────────────────────────────────────
+# -- MainWindow ---------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    """Top-level PyQt5 window – replaces Tkinter CombinedApp."""
+    """Top-level PyQt5 window - replaces Tkinter CombinedApp."""
 
     def __init__(self):
         super().__init__()
@@ -706,18 +989,20 @@ class MainWindow(QMainWindow):
         self.frame_pre_params: Dict[int, Tuple[float, int]] = {}
         self._active_pre_key: Optional[int] = None
 
+        self._undo_stack: deque = deque(maxlen=20)
+
         self._build_menu()
         self._build_toolbar()
         self._build_central()
-        self.statusBar().showMessage("Ready — Ctrl+O to open an image.")
+        self.statusBar().showMessage("Ready - Ctrl+O to open an image.")
 
-    # ── Menu ─────────────────────────────────────────────────────────────────
+    # -- Menu -----------------------------------------------------------------
 
     def _build_menu(self):
         mb = self.menuBar()
 
         file_m = mb.addMenu("File")
-        file_m.addAction(self._act("Open Image  (Ctrl+O)", self.open_image, "Ctrl+O"))
+        file_m.addAction(self._act("Open Image(s)  (Ctrl+O)", self.open_image, "Ctrl+O"))
         file_m.addSeparator()
         file_m.addAction(self._act("Save Annotated  (Ctrl+S)", self.save_annotated, "Ctrl+S"))
         file_m.addAction(self._act("Save Binary Mask", self.save_binary))
@@ -734,10 +1019,15 @@ class MainWindow(QMainWindow):
         file_m.addSeparator()
         file_m.addAction(self._act("Exit", self.close))
 
+        edit_m = mb.addMenu("Edit")
+        edit_m.addAction(self._act("Undo  (Ctrl+Z)", self._undo, "Ctrl+Z"))
+
         view_m = mb.addMenu("View")
         view_m.addAction(self._act("Preprocessed", lambda: self.set_view("preprocessed")))
         view_m.addAction(self._act("Binary Mask", lambda: self.set_view("binary")))
         view_m.addAction(self._act("Contours", lambda: self.set_view("contours")))
+        view_m.addSeparator()
+        view_m.addAction(self._act("Align by Line", self._start_align_mode))
         view_m.addSeparator()
         view_m.addAction(self._act("Fit to View  (F)", self.fit_to_view, "F"))
 
@@ -751,7 +1041,15 @@ class MainWindow(QMainWindow):
         a.triggered.connect(slot)
         return a
 
-    # ── Toolbar ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _series_sort_key(path: str):
+        name = Path(path).name.lower()
+        return [
+            int(tok) if tok.isdigit() else tok
+            for tok in re.split(r"(\d+)", name)
+        ]
+
+    # -- Toolbar ---------------------------------------------------------------
 
     def _build_toolbar(self):
         tb = self.addToolBar("Main")
@@ -759,6 +1057,7 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(16, 16))
 
         btn_open = QPushButton("  Open")
+        btn_open.setToolTip("Open one/multiple images or TIFF stack (Ctrl+O)")
         btn_open.clicked.connect(self.open_image)
         tb.addWidget(btn_open)
 
@@ -766,25 +1065,52 @@ class MainWindow(QMainWindow):
 
         btn_detect = QPushButton("  Detect Frame")
         btn_detect.setObjectName("accentBtn")
+        btn_detect.setToolTip("Run contour detection on the current frame")
         btn_detect.clicked.connect(self.detect_current)
         tb.addWidget(btn_detect)
 
         btn_all = QPushButton("  Detect All")
         btn_all.setObjectName("greenBtn")
+        btn_all.setToolTip("Run contour detection on all frames in the stack")
         btn_all.clicked.connect(self.detect_all)
         tb.addWidget(btn_all)
 
         tb.addSeparator()
 
-        for label, view in (("Preproc.", "preprocessed"),
-                            ("Binary", "binary"), ("Contours", "contours")):
+        for label, view, tip in (
+            ("Preproc.", "preprocessed", "Show preprocessed grayscale image"),
+            ("Binary",  "binary",        "Show binary threshold mask"),
+            ("Contours","contours",      "Show detected contour overlay"),
+        ):
             b = QPushButton(label)
+            b.setToolTip(tip)
             b.clicked.connect(lambda _c, v=view: self.set_view(v))
             tb.addWidget(b)
+
+        self._btn_roi = QPushButton("  ROI")
+        self._btn_roi.setCheckable(True)
+        self._btn_roi.setToolTip(
+            "Draw ROI with left-drag. Then drag inside/handles to move or resize."
+        )
+        self._btn_roi.clicked.connect(self._on_toolbar_roi_toggle)
+        tb.addWidget(self._btn_roi)
+
+        self._align_target_cb = QComboBox()
+        self._align_target_cb.addItems(["Vertical", "Horizontal"])
+        self._align_target_cb.setToolTip("Target orientation for line-based alignment")
+        self._align_target_cb.setFixedWidth(110)
+        tb.addWidget(self._align_target_cb)
+
+        self._btn_align = QPushButton("  Align")
+        self._btn_align.setCheckable(True)
+        self._btn_align.setToolTip("Draw a reference line on the image to align stack")
+        self._btn_align.clicked.connect(self._on_align_toggle)
+        tb.addWidget(self._btn_align)
 
         tb.addSeparator()
 
         btn_fit = QPushButton("Fit")
+        btn_fit.setToolTip("Fit image to window (F)")
         btn_fit.clicked.connect(self.fit_to_view)
         tb.addWidget(btn_fit)
 
@@ -793,11 +1119,11 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         tb.addWidget(spacer)
 
-        self.zoom_label = QLabel("Zoom: 1.00×")
+        self.zoom_label = QLabel("Zoom: 1.00x")
         self.zoom_label.setStyleSheet(f"color: {_SUBTEXT}; padding-right: 8px;")
         tb.addWidget(self.zoom_label)
 
-    # ── Central layout ────────────────────────────────────────────────────────
+    # -- Central layout --------------------------------------------------------
 
     def _build_central(self):
         root_splitter = QSplitter(Qt.Horizontal)
@@ -859,10 +1185,12 @@ class MainWindow(QMainWindow):
 
         self.canvas = ImageCanvas()
         self.canvas.zoom_changed.connect(
-            lambda z: self.zoom_label.setText(f"Zoom: {z:.2f}×")
+            lambda z: self.zoom_label.setText(f"Zoom: {z:.2f}x")
         )
         self.canvas.status_message.connect(self.statusBar().showMessage)
         self.canvas.points_captured.connect(self._on_canvas_points)
+        self.canvas.roi_changed.connect(self._on_roi_changed)
+        self.canvas.align_line_drawn.connect(self._on_align_line_drawn)
         img_hist_split.addWidget(self.canvas)
 
         hist_w = QWidget()
@@ -908,7 +1236,7 @@ class MainWindow(QMainWindow):
         root_splitter.setStretchFactor(0, 0)
         root_splitter.setStretchFactor(1, 1)
 
-    # ── Frame navigation ──────────────────────────────────────────────────────
+    # -- Frame navigation ------------------------------------------------------
 
     def _build_frame_nav(self, layout):
         box = QGroupBox("Frame Navigation")
@@ -950,7 +1278,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(box)
 
-    # ── Contour table ─────────────────────────────────────────────────────────
+    # -- Contour table ---------------------------------------------------------
 
     def _build_table(self, parent: QWidget):
         vbox = QVBoxLayout(parent)
@@ -979,7 +1307,7 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_table_select)
         vbox.addWidget(self.table)
 
-    # ── Preprocessing tab ─────────────────────────────────────────────────────
+    # -- Preprocessing tab -----------------------------------------------------
 
     def _build_preprocessing_tab(self, parent: QWidget):
         vbox = QVBoxLayout(parent)
@@ -998,10 +1326,12 @@ class MainWindow(QMainWindow):
         self.pre_alpha_sl = LabeledSlider(
             "Contrast (alpha):", 0.1, 20.0, 1.0, is_float=True, float_scale=10
         )
+        self.pre_alpha_sl.setToolTip("Contrast multiplier - 1.0 = no change, >1 increases contrast")
         self.pre_alpha_sl.value_changed.connect(self._on_pre_change)
         g_lay.addWidget(self.pre_alpha_sl)
 
         self.pre_beta_sl = LabeledSlider("Brightness (beta):", -100, 100, 0)
+        self.pre_beta_sl.setToolTip("Brightness offset - positive = brighter, negative = darker")
         self.pre_beta_sl.value_changed.connect(self._on_pre_change)
         g_lay.addWidget(self.pre_beta_sl)
 
@@ -1011,6 +1341,7 @@ class MainWindow(QMainWindow):
         grp_blur = QGroupBox("Gaussian Blur")
         gb_lay = QVBoxLayout(grp_blur)
         self.pre_blur_sl = LabeledSlider("Blur ksize (odd):", 1, 31, 5)
+        self.pre_blur_sl.setToolTip("Gaussian blur kernel size (odd) - larger = more blur")
         self.pre_blur_sl.value_changed.connect(self._on_pre_change)
         gb_lay.addWidget(self.pre_blur_sl)
         vbox.addWidget(grp_blur)
@@ -1020,7 +1351,7 @@ class MainWindow(QMainWindow):
         gn_lay = QVBoxLayout(grp_norm)
         gn_lay.setSpacing(6)
 
-        lbl_target = QLabel("Target peak intensity (0–255):")
+        lbl_target = QLabel("Target peak intensity (0-255):")
         lbl_target.setStyleSheet(f"color: {_SUBTEXT};")
         gn_lay.addWidget(lbl_target)
 
@@ -1070,7 +1401,7 @@ class MainWindow(QMainWindow):
 
         vbox.addStretch()
 
-    # ── Contour tab ───────────────────────────────────────────────────────────
+    # -- Contour tab -----------------------------------------------------------
 
     def _build_contour_tab(self, parent: QWidget):
         vbox = QVBoxLayout(parent)
@@ -1082,8 +1413,7 @@ class MainWindow(QMainWindow):
         gm_lay = QVBoxLayout(grp_m)
         gm_lay.addWidget(QLabel("Method:"))
         self.method_cb = QComboBox()
-        methods = ["Otsu Threshold", "Binary Threshold", "Inv. Binary Threshold",
-                   "Adaptive Mean", "Adaptive Gaussian", "Canny Edge"]
+        methods = ["Binary Threshold", "Canny Edge"]
         self.method_cb.addItems(methods)
         self.method_cb.currentTextChanged.connect(self._update_method_frames)
         gm_lay.addWidget(self.method_cb)
@@ -1093,11 +1423,13 @@ class MainWindow(QMainWindow):
         grp_dp = QGroupBox("Detection Preprocessing")
         gdp = QVBoxLayout(grp_dp)
         self.det_blur_sl = LabeledSlider("Extra blur ksize (odd):", 1, 31, 5)
+        self.det_blur_sl.setToolTip("Extra blur applied just before thresholding in the detector")
         gdp.addWidget(self.det_blur_sl)
         self.use_morph_cb = QCheckBox("Morphological closing")
         self.use_morph_cb.setChecked(True)
         gdp.addWidget(self.use_morph_cb)
         self.morph_ksize_sl = LabeledSlider("Morph ksize (odd):", 1, 21, 5)
+        self.morph_ksize_sl.setToolTip("Morphological closing kernel size - helps fill contour gaps")
         gdp.addWidget(self.morph_ksize_sl)
         vbox.addWidget(grp_dp)
 
@@ -1105,13 +1437,16 @@ class MainWindow(QMainWindow):
         self.grp_thresh = QGroupBox("Threshold")
         gt = QVBoxLayout(self.grp_thresh)
         self.thresh_sl = LabeledSlider("Threshold value:", 0, 255, 127)
+        self.thresh_sl.setToolTip("Pixel threshold (0-255) - pixels above become white in binary mask")
         gt.addWidget(self.thresh_sl)
         vbox.addWidget(self.grp_thresh)
 
         self.grp_canny = QGroupBox("Canny")
         gc = QVBoxLayout(self.grp_canny)
         self.canny_low_sl = LabeledSlider("Low:", 0, 500, 50)
+        self.canny_low_sl.setToolTip("Canny lower hysteresis threshold - lower = more edge detail")
         self.canny_high_sl = LabeledSlider("High:", 0, 500, 150)
+        self.canny_high_sl.setToolTip("Canny upper hysteresis threshold - higher = stricter edges")
         gc.addWidget(self.canny_low_sl)
         gc.addWidget(self.canny_high_sl)
         vbox.addWidget(self.grp_canny)
@@ -1122,9 +1457,17 @@ class MainWindow(QMainWindow):
         grp_f = QGroupBox("Filtering")
         gf = QVBoxLayout(grp_f)
         self.min_area_sl = LabeledSlider("Min area:", 0, 20000, 100)
+        self.min_area_sl.setToolTip("Minimum contour area in pixels - smaller shapes are discarded")
         self.max_area_sl = LabeledSlider("Max area (0=off):", 0, 500000, 0)
+        self.max_area_sl.setToolTip("Maximum contour area (0 = no limit)")
+        self.min_rect_width_sl = LabeledSlider("Min width (px, 0=off):", 0, 50, 5)
+        self.min_rect_width_sl.setToolTip(
+            "Reject contours whose thinnest dimension is below this value - "
+            "removes straight-line artefacts"
+        )
         gf.addWidget(self.min_area_sl)
         gf.addWidget(self.max_area_sl)
+        gf.addWidget(self.min_rect_width_sl)
         vbox.addWidget(grp_f)
 
         # Drawing options
@@ -1154,10 +1497,24 @@ class MainWindow(QMainWindow):
         btn_all.clicked.connect(self.detect_all)
         vbox.addWidget(btn_all)
 
-        note = QLabel("Preprocessing is auto-cached when entering this tab.")
-        note.setWordWrap(True)
-        note.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
-        vbox.addWidget(note)
+        grp_roi = QGroupBox("Region of Interest (ROI)")
+        gr = QVBoxLayout(grp_roi)
+        roi_btn_row = QHBoxLayout()
+        btn_draw_roi = QPushButton("Draw ROI")
+        btn_draw_roi.setToolTip(
+            "Activate ROI mode - left-drag to create; drag ROI/handles to adjust."
+        )
+        btn_draw_roi.clicked.connect(self._on_roi_draw)
+        btn_clear_roi = QPushButton("Clear ROI")
+        btn_clear_roi.setToolTip("Remove ROI - detection uses the full image")
+        btn_clear_roi.clicked.connect(self._on_roi_clear)
+        roi_btn_row.addWidget(btn_draw_roi)
+        roi_btn_row.addWidget(btn_clear_roi)
+        gr.addLayout(roi_btn_row)
+        self._roi_status_lbl = QLabel("No ROI set")
+        self._roi_status_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
+        gr.addWidget(self._roi_status_lbl)
+        vbox.addWidget(grp_roi)
         vbox.addStretch()
 
     @staticmethod
@@ -1172,7 +1529,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(row)
         return edit
 
-    # ── Curvature tab ─────────────────────────────────────────────────────────
+    # -- Curvature tab ---------------------------------------------------------
 
     def _build_curvature_tab(self, parent: QWidget):
         vbox = QVBoxLayout(parent)
@@ -1212,17 +1569,22 @@ class MainWindow(QMainWindow):
         grp_calc = QGroupBox("Spline & Curvature")
         gc = QVBoxLayout(grp_calc)
         self.smooth_sl = LabeledSlider("Smoothing factor (s):", 0, 2000, 300)
+        self.smooth_sl.setToolTip("B-spline smoothing (s=0 exact fit, higher = smoother)")
         self.res_sl = LabeledSlider(
             "Resolution multiplier:", 1.0, 5.0, 2.0, is_float=True, float_scale=10
         )
+        self.res_sl.setToolTip("Output spline point density multiplier")
         gc.addWidget(self.smooth_sl)
         gc.addWidget(self.res_sl)
         btn_compute = QPushButton("Compute Curvature (Current)")
         btn_compute.setObjectName("accentBtn")
+        btn_compute.setShortcut("Ctrl+Return")
+        btn_compute.setToolTip("Fit spline and compute curvature for current frame (Ctrl+Enter)")
         btn_compute.clicked.connect(self.compute_curvature)
 
         btn_compute_all = QPushButton("Compute Curvature (All Frames)")
         btn_compute_all.setObjectName("greenBtn")
+        btn_compute_all.setToolTip("Batch compute curvature on largest contour of every frame")
         btn_compute_all.clicked.connect(self.compute_curvature_all)
 
         calc_btn_row = QHBoxLayout()
@@ -1234,7 +1596,9 @@ class MainWindow(QMainWindow):
         grp_vis = QGroupBox("Visualization")
         gv = QVBoxLayout(grp_vis)
         self.vec_density_sl = LabeledSlider("Vector step (density):", 5, 50, 15)
+        self.vec_density_sl.setToolTip("Draw a tangent/normal vector every N spline points")
         self.vec_len_sl = LabeledSlider("Vector length (px):", 10, 500, 50)
+        self.vec_len_sl.setToolTip("Visual length of tangent/normal vectors in screen pixels")
         self.vec_density_sl.value_changed.connect(self._on_vec_change)
         self.vec_len_sl.value_changed.connect(self._on_vec_change)
         gv.addWidget(self.vec_density_sl)
@@ -1245,21 +1609,24 @@ class MainWindow(QMainWindow):
         vbox.addWidget(grp_vis)
 
         self.curv_msg_lbl = QLabel(
-            "Tip: select a contour row then click 'Select contour'."
+            "\u2139  Tip: select a contour row in the table, then click 'Select contour'."
         )
         self.curv_msg_lbl.setWordWrap(True)
-        self.curv_msg_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt;")
+        self.curv_msg_lbl.setStyleSheet(
+            f"color: {_SUBTEXT}; font-size: 9pt; "
+            f"background: {_PANEL}; border-radius: 4px; padding: 4px 6px;"
+        )
         vbox.addWidget(self.curv_msg_lbl)
         vbox.addStretch()
 
-    # ── Method visibility ─────────────────────────────────────────────────────
+    # -- Method visibility -----------------------------------------------------
 
     def _update_method_frames(self):
         m = self.method_cb.currentText()
-        self.grp_thresh.setVisible(m in ("Binary Threshold", "Inv. Binary Threshold"))
+        self.grp_thresh.setVisible(m == "Binary Threshold")
         self.grp_canny.setVisible(m == "Canny Edge")
 
-    # ── Preprocessing helpers ─────────────────────────────────────────────────
+    # -- Preprocessing helpers -------------------------------------------------
 
     def _current_pre_params(self, frame_idx: Optional[int] = None) -> PreprocessParams:
         if frame_idx is None:
@@ -1296,6 +1663,7 @@ class MainWindow(QMainWindow):
             morph_ksize=int(self.morph_ksize_sl.get_value()),
             min_area=int(self.min_area_sl.get_value()),
             max_area=max_area_val,
+            min_rect_width=int(self.min_rect_width_sl.get_value()),
             contour_color=(0, 255, 0),
             bbox_color=(255, 0, 0),
             centroid_color=(0, 0, 255),
@@ -1303,6 +1671,8 @@ class MainWindow(QMainWindow):
             draw_bbox=self.draw_bbox_cb.isChecked(),
             draw_centroid=self.draw_centroid_cb.isChecked(),
             draw_labels=self.draw_labels_cb.isChecked(),
+            reject_straight_lines=True,
+            straight_line_tol=0.006,
         )
 
     def _reset_pre_defaults(self):
@@ -1316,6 +1686,7 @@ class MainWindow(QMainWindow):
         if not self.detector.frames:
             QMessageBox.warning(self, "No image", "Open an image first.")
             return
+        self._save_undo("Peak normalization")
         target = self.peak_target_sb.value()
         n = self.detector.num_frames
         k = int(self.pre_blur_sl.get_value())
@@ -1343,14 +1714,14 @@ class MainWindow(QMainWindow):
         self.detector.set_frame(orig_idx)
         self._active_pre_key = None
         self.peak_norm_lbl.setText(
-            f"Applied to {applied}/{n} frames — target peak: {target}"
+            f"Applied to {applied}/{n} frames - target peak: {target}"
         )
         self._render_pre_preview()
         if self.detector.original is not None:
             pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
             self._update_histogram(pre_gray)
         self.statusBar().showMessage(
-            f"Peak normalization done — target {target} — {applied}/{n} frame(s) updated."
+            f"Peak normalization done - target {target} - {applied}/{n} frame(s) updated."
         )
 
     def _on_pre_change(self):
@@ -1360,6 +1731,10 @@ class MainWindow(QMainWindow):
                 self.pre_alpha_sl.get_value(), int(self.pre_beta_sl.get_value())
             )
         self.detector.cache.clear()
+        self.curv.clear()
+        self.canvas.curve_data = None
+        self.canvas.points_x = []
+        self.canvas.points_y = []
         self.selected_contour_index = None
         self._populate_table([])
         self._update_frame_ui()
@@ -1386,7 +1761,7 @@ class MainWindow(QMainWindow):
             self.pre_preview.setPixmap(
                 pm.scaled(pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             )
-            self.pre_msg_lbl.setText("Live preview — changes applied instantly.")
+            self.pre_msg_lbl.setText("Live preview - changes applied instantly.")
         except Exception as e:
             self.pre_msg_lbl.setText(f"Preview error: {e}")
 
@@ -1397,7 +1772,7 @@ class MainWindow(QMainWindow):
         pre = self._current_pre_params()
         if n >= 15:
             prog = QProgressDialog(
-                "Preprocessing all frames…", None, 0, n, self
+                "Preprocessing all frames...", None, 0, n, self
             )
             prog.setWindowTitle("Preprocessing")
             prog.setWindowModality(Qt.WindowModal)
@@ -1423,7 +1798,7 @@ class MainWindow(QMainWindow):
             f"Preprocessing cached for all {n} frames."
         )
 
-    # ── Tab changed ───────────────────────────────────────────────────────────
+    # -- Tab changed -----------------------------------------------------------
 
     def _on_tab_changed(self, idx: int):
         tab_text = self.nb.tabText(idx)
@@ -1439,13 +1814,13 @@ class MainWindow(QMainWindow):
             self._populate_table([])
             self._update_frame_ui()
             self.statusBar().showMessage(
-                "Preprocessing changed — detections cleared."
+                "Preprocessing changed - detections cleared."
             )
         self._apply_preprocessing_all_frames()
         self._active_pre_key = pre_key
         self._refresh_view()
 
-    # ── View helpers ──────────────────────────────────────────────────────────
+    # -- View helpers ----------------------------------------------------------
 
     def _get_base_cv(self) -> Optional[np.ndarray]:
         if self.detector.original is None:
@@ -1528,57 +1903,253 @@ class MainWindow(QMainWindow):
     def fit_to_view(self):
         self.canvas.fit_to_view()
 
-    # ── Open / Detect / Save ──────────────────────────────────────────────────
+    # -- ROI -------------------------------------------------------------------
+
+    def _get_roi_tuple(self):
+        r = self.canvas.roi_rect
+        if r is None or r.width() <= 0 or r.height() <= 0:
+            return None
+        return (r.x(), r.y(), r.width(), r.height())
+
+    def _on_toolbar_roi_toggle(self, checked: bool):
+        if checked:
+            self.canvas.roi_mode = True
+            self.canvas.align_mode = False
+            self._btn_align.setChecked(False)
+            self.canvas.draw_enabled = False
+            self.draw_enabled_cb.setChecked(False)
+            self.statusBar().showMessage("ROI mode: left-drag on canvas to draw the region.")
+        else:
+            self.canvas.roi_mode = False
+
+    def _on_roi_draw(self):
+        self.canvas.roi_mode = True
+        self.canvas.align_mode = False
+        self._btn_align.setChecked(False)
+        self.canvas.draw_enabled = False
+        self.draw_enabled_cb.setChecked(False)
+        self._btn_roi.setChecked(True)
+        self.statusBar().showMessage("ROI mode: left-drag on canvas to draw the region.")
+
+    def _on_roi_clear(self):
+        self._save_undo("Clear ROI")
+        self.canvas.roi_rect = None
+        self.canvas.roi_mode = False
+        self._btn_roi.setChecked(False)
+        self._roi_status_lbl.setText("No ROI set")
+        self.canvas.update()
+        self.statusBar().showMessage("ROI cleared - detection uses full image.")
+
+    def _on_roi_changed(self, roi_rect):
+        self._btn_roi.setChecked(False)
+        if roi_rect is not None:
+            x, y, w, h = roi_rect.x(), roi_rect.y(), roi_rect.width(), roi_rect.height()
+            self._roi_status_lbl.setText(f"ROI: ({x}, {y})  {w}x{h} px")
+            self.statusBar().showMessage("ROI set - run detection to apply.")
+        else:
+            self._roi_status_lbl.setText("No ROI set")
+
+    # -- Open / Detect / Save --------------------------------------------------
 
     def open_image(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open image", "",
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open image(s)", "",
             "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*.*)",
         )
-        if not path:
+        if not paths:
             return
+        paths = sorted(paths, key=self._series_sort_key)
         try:
-            self.detector.load(path)
+            if len(paths) == 1:
+                self.detector.load(paths[0])
+            else:
+                self.detector.load_paths(paths)
             self.frame_pre_params.clear()
-
-            self.current_view = "preprocessed"
-            self.selected_contour_index = None
-            self.curv.clear()
-            self._active_pre_key = None
-            self.canvas.curve_data = None
-            self.canvas.points_x = []
-            self.canvas.points_y = []
-            self.canvas.contours = []
-            self.canvas.selected_contour_idx = None
-
-            self._update_frame_ui()
-            self._populate_table([])
-
-            self._render_pre_preview()
-            self.view_label.setText("View: Preprocessed")
-            pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
-            self.canvas.set_image(pre_gray)
-            self.canvas.fit_to_view()
-            self._update_histogram(pre_gray)
+            self._undo_stack.clear()
+            self._reset_after_stack_transform()
 
             orig = self.detector.original
             shape = orig.shape
             ch = shape[2] if orig.ndim == 3 else 1
             self.statusBar().showMessage(
-                f"Loaded: {Path(path).name} | Frames: {self.detector.num_frames} | "
-                f"Size: {shape[1]}×{shape[0]} | Dtype: {orig.dtype} | Channels: {ch}"
+                f"Loaded: {(Path(paths[0]).name if len(paths) == 1 else str(len(paths)) + ' files as series')} | Frames: {self.detector.num_frames} | "
+                f"Size: {shape[1]}x{shape[0]} | Dtype: {orig.dtype} | Channels: {ch}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Open error", str(e))
+
+    def _reset_after_stack_transform(self):
+        self.current_view = "preprocessed"
+        self.view_label.setText("View: Preprocessed")
+        self.selected_contour_index = None
+        self.curv.clear()
+        self._active_pre_key = None
+        self.canvas.curve_data = None
+        self.canvas.points_x = []
+        self.canvas.points_y = []
+        self.canvas.contours = []
+        self.canvas.selected_contour_idx = None
+        self.canvas.roi_rect = None
+        self.canvas.roi_mode = False
+        self._btn_roi.setChecked(False)
+        self.canvas.align_mode = False
+        self.canvas._align_start = None
+        self.canvas._align_end = None
+        self._btn_align.setChecked(False)
+        self._roi_status_lbl.setText("No ROI set")
+        self._populate_table([])
+
+        self._render_pre_preview()
+        pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+        self.canvas.set_image(pre_gray)
+        self.canvas.fit_to_view()
+        self._update_histogram(pre_gray)
+        self._update_frame_ui()
+
+    @staticmethod
+    def _norm_angle_deg(a: float) -> float:
+        return ((float(a) + 180.0) % 360.0) - 180.0
+
+    # -- Undo ------------------------------------------------------------------
+
+    def _save_undo(self, description: str):
+        """Snapshot current state onto the undo stack before a destructive action."""
+        snap = {
+            "desc": description,
+            "rotation_angle": self.detector.rotation_angle,
+            "current_frame_idx": self.detector.current_frame_idx,
+            "cache": copy.deepcopy(self.detector.cache),
+            "pre_cache": {},  # lightweight: let it recompute
+            "frame_pre_params": dict(self.frame_pre_params),
+            "current_view": self.current_view,
+            "selected_contour_index": self.selected_contour_index,
+            "roi_rect": QRect(self.canvas.roi_rect) if self.canvas.roi_rect is not None else None,
+            "canvas_points_x": self.canvas.points_x[:],
+            "canvas_points_y": self.canvas.points_y[:],
+            "curve_data": copy.deepcopy(self.curv.curve_data),
+            "curv_points_x": self.curv.points_x[:],
+            "curv_points_y": self.curv.points_y[:],
+        }
+        self._undo_stack.append(snap)
+
+    def _undo(self):
+        if not self._undo_stack:
+            self.statusBar().showMessage("Nothing to undo.")
+            return
+        snap = self._undo_stack.pop()
+
+        # Restore detector state
+        self.detector.rotation_angle = snap["rotation_angle"]
+        self.detector.cache = snap["cache"]
+        self.detector.pre_cache.clear()
+        self.detector.set_frame(snap["current_frame_idx"])
+
+        # Restore app state
+        self.frame_pre_params = snap["frame_pre_params"]
+        self.selected_contour_index = snap["selected_contour_index"]
+        self._active_pre_key = None
+
+        # Restore canvas overlay state
+        self.canvas.points_x = snap["canvas_points_x"]
+        self.canvas.points_y = snap["canvas_points_y"]
+        self.canvas.roi_rect = snap["roi_rect"]
+        self._roi_status_lbl.setText(
+            "No ROI set" if snap["roi_rect"] is None
+            else f"ROI: {snap['roi_rect'].width()}x{snap['roi_rect'].height()}"
+        )
+
+        # Restore curvature state
+        self.curv.points_x = snap["curv_points_x"]
+        self.curv.points_y = snap["curv_points_y"]
+        self.curv.curve_data = snap["curve_data"]
+        self.canvas.curve_data = snap["curve_data"]
+
+        # Refresh UI
+        self.set_view(snap["current_view"])
+        self._update_frame_ui()
+        self._render_pre_preview()
+        if self.detector.original is not None:
+            pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
+            self._update_histogram(pre_gray)
+
+        self.statusBar().showMessage(f"Undone: {snap['desc']}")
+
+    def _on_align_toggle(self, checked: bool):
+        if checked:
+            self._start_align_mode()
+        else:
+            self.canvas.align_mode = False
+            self.canvas._align_start = None
+            self.canvas._align_end = None
+            self.canvas.update()
+
+    def _start_align_mode(self):
+        if self.detector.original is None:
+            QMessageBox.warning(self, "No image", "Open an image first.")
+            self._btn_align.setChecked(False)
+            return
+        self.canvas.align_mode = True
+        self.canvas.draw_enabled = False
+        self.draw_enabled_cb.setChecked(False)
+        self.canvas.roi_mode = False
+        self._btn_roi.setChecked(False)
+        self._btn_align.setChecked(True)
+        target = self._align_target_cb.currentText().lower()
+        self.statusBar().showMessage(
+            f"Alignment mode: draw a line to align it {target}."
+        )
+
+    def _on_align_line_drawn(self, line):
+        self._btn_align.setChecked(False)
+        if line is None:
+            self.statusBar().showMessage("Alignment cancelled.")
+            return
+        if self.detector.original is None or not self.detector.frames:
+            return
+        x0, y0, x1, y1 = map(float, line)
+        dx, dy = (x1 - x0), (y1 - y0)
+        if math.hypot(dx, dy) < 1e-6:
+            self.statusBar().showMessage("Alignment line too short.")
+            return
+
+        line_angle = math.degrees(math.atan2(dy, dx))
+        target = self._align_target_cb.currentText().lower()
+        # The draw direction determines the target orientation:
+        #   Vertical:   draw upward (dy<0) → tip faces up (-90°)
+        #               draw downward (dy>0) → tip faces down (+90°)
+        #   Horizontal: draw rightward (dx>0) → tip faces right (0°)
+        #               draw leftward (dx<0) → tip faces left (180°)
+        if target == "horizontal":
+            target_angle = 0.0 if dx >= 0 else 180.0
+        else:
+            target_angle = -90.0 if dy <= 0 else 90.0
+        rot = self._norm_angle_deg(line_angle - target_angle)
+        if abs(rot) < 0.05:
+            self.statusBar().showMessage("Image already aligned.")
+            return
+        self._save_undo("Align by line")
+        try:
+            self.detector.rotate_stack_by_angle(rot)
+        except Exception as e:
+            self._undo_stack.pop()  # discard snapshot on failure
+            QMessageBox.critical(self, "Alignment error", str(e))
+            return
+
+        self._reset_after_stack_transform()
+        direction = "CCW" if rot > 0 else "CW"
+        self.statusBar().showMessage(
+            f"Aligned by rotating {abs(rot):.2f} deg {direction}. Detections were cleared."
+        )
 
     def detect_current(self):
         if self.detector.original is None:
             QMessageBox.warning(self, "No image", "Open an image first.")
             return
+        self._save_undo("Detect current frame")
         try:
             params = self._get_detect_params()
             pre = self._current_pre_params()
-            res = self.detector.detect(params, pre)
+            res = self.detector.detect(params, pre, self._get_roi_tuple())
             self._populate_table(res["properties"])
             self.set_view("contours")
             self._update_frame_ui()
@@ -1602,11 +2173,13 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.Yes:
                 return
 
+        self._save_undo("Detect all frames")
         params = self._get_detect_params()
+        roi = self._get_roi_tuple()
         orig_idx = self.detector.current_frame_idx
 
         prog = QProgressDialog(
-            "Detecting contours on all frames…", "Cancel", 0, n, self
+            "Detecting contours on all frames...", "Cancel", 0, n, self
         )
         prog.setWindowTitle("Processing")
         prog.setWindowModality(Qt.WindowModal)
@@ -1618,11 +2191,11 @@ class MainWindow(QMainWindow):
                     break
                 self.detector.set_frame(i)
                 pre = self._current_pre_params(i)
-                r = self.detector.detect(params, pre)
+                r = self.detector.detect(params, pre, roi)
                 total += len(r["contours"])
                 prog.setValue(i + 1)
                 prog.setLabelText(
-                    f"Frame {i + 1} / {n}  —  {len(r['contours'])} contour(s)"
+                    f"Frame {i + 1} / {n} - {len(r['contours'])} contour(s)"
                 )
                 QApplication.processEvents()
         except Exception as e:
@@ -1640,9 +2213,9 @@ class MainWindow(QMainWindow):
             self, "Done",
             f"Detection complete on {n} frames.\nTotal contours: {total}",
         )
-        self.statusBar().showMessage(f"All frames processed — total contours: {total}")
+        self.statusBar().showMessage(f"All frames processed - total contours: {total}")
 
-    # ── Frame navigation ──────────────────────────────────────────────────────
+    # -- Frame navigation ------------------------------------------------------
 
     def _update_frame_ui(self):
         n = self.detector.num_frames
@@ -1660,9 +2233,12 @@ class MainWindow(QMainWindow):
         self.frame_info_lbl.setText(f"Frame {idx + 1} / {n}")
         self.frame_entry.setText(str(idx + 1))
         cached = self.detector.cache.get(idx)
-        self.detect_info_lbl.setText(
-            f"Done: {len(cached['contours'])} contour(s)" if cached else "Not detected"
-        )
+        if cached:
+            self.detect_info_lbl.setText(f"  {len(cached['contours'])} contour(s)")
+            self.detect_info_lbl.setStyleSheet(f"color: {_GREEN}; font-weight: bold;")
+        else:
+            self.detect_info_lbl.setText("Not detected")
+            self.detect_info_lbl.setStyleSheet(f"color: {_YELLOW};")
 
     def _on_frame_slider(self, val: int):
         if not self.detector.frames:
@@ -1721,7 +2297,7 @@ class MainWindow(QMainWindow):
     def next_frame(self):
         self.go_to_frame(self.detector.current_frame_idx + 1)
 
-    # ── Table ─────────────────────────────────────────────────────────────────
+    # -- Table -----------------------------------------------------------------
 
     def _populate_table(self, props: List[Dict]):
         self.table.setRowCount(0)
@@ -1748,11 +2324,16 @@ class MainWindow(QMainWindow):
         self.canvas.selected_contour_idx = self.selected_contour_index
         self.canvas.update()
 
-    # ── Curvature actions ─────────────────────────────────────────────────────
+    # -- Curvature actions -----------------------------------------------------
 
     def _on_draw_enabled(self, state: int):
         enabled = bool(state)
         self.canvas.draw_enabled = enabled
+        if enabled:
+            self.canvas.align_mode = False
+            self._btn_align.setChecked(False)
+            self.canvas.roi_mode = False
+            self._btn_roi.setChecked(False)
         self.curv_msg_lbl.setText(
             "Left-drag to draw a curve on the image."
             if enabled else "Manual drawing disabled."
@@ -1812,6 +2393,7 @@ class MainWindow(QMainWindow):
         self.use_selected_contour()
 
     def clear_curvature(self):
+        self._save_undo("Clear curvature")
         self.curv.clear()
         self.canvas.curve_data = None
         self.canvas.points_x = []
@@ -1822,6 +2404,7 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     def compute_curvature(self):
+        self._save_undo("Compute curvature")
         try:
             data = self.curv.compute(
                 smooth=float(self.smooth_sl.get_value()),
@@ -1903,7 +2486,7 @@ class MainWindow(QMainWindow):
             self, "Done", f"Curvature computed for {success_count} frames."
         )
 
-    # ── Save / Export ─────────────────────────────────────────────────────────
+    # -- Save / Export ---------------------------------------------------------
 
     def save_annotated(self):
         cached = self.detector.cache.get(self.detector.current_frame_idx)
@@ -2100,28 +2683,24 @@ class MainWindow(QMainWindow):
                         data["nx"][j], data["ny"][j]
                     ])
 
-    # ── About ─────────────────────────────────────────────────────────────────
-
     def _about(self):
         QMessageBox.information(
-            self, "About – Tip Curvature Analyzer v2",
+            self, "About - Tip Curvature Analyzer v2",
             "TIFF Contour + Curvature Analyzer\n\n"
-            "• Preprocessing tab – live contrast/blur preview\n"
-            "• Contour tab – multiple threshold methods, CSV export\n"
-            "• Curvature tab – spline fitting, hover inspection\n\n"
+            "-¢ Preprocessing tab - live contrast/blur preview\n"
+            "-¢ Contour tab - multiple threshold methods, CSV export\n"
+            "-¢ Curvature tab - spline fitting, hover inspection\n\n"
             "Keyboard shortcuts:\n"
             "  Ctrl+O  Open image\n"
             "  Ctrl+S  Save annotated\n"
             "  F       Fit to view\n"
-            "  ←/→     Navigate frames\n\n"
+            "  â†/->     Navigate frames\n\n"
             "Canvas controls:\n"
             "  Scroll wheel  Zoom\n"
             "  Right-drag    Pan\n"
             "  Left-drag     Draw (when enabled)\n"
         )
 
-
-# ── Application entry point ──────────────────────────────────────────────────
 
 def run():
     import sys
@@ -2130,3 +2709,4 @@ def run():
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())
+

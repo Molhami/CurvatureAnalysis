@@ -1,7 +1,6 @@
 """Image utility functions for loading, conversion and helpers."""
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import List, Tuple
 
@@ -47,17 +46,6 @@ def cv_to_pil_rgb(img: np.ndarray) -> Image.Image:
     else:
         rgb = cv2.cvtColor(img8, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
-
-
-def parse_bgr(s: str, default: Tuple[int, int, int]) -> Tuple[int, int, int]:
-    """Parse a 'B,G,R' string to a BGR tuple, falling back to *default*."""
-    try:
-        parts = [int(x.strip()) for x in s.split(",")]
-        if len(parts) == 3:
-            return tuple(int(x) for x in np.clip(parts, 0, 255))  # type: ignore
-    except Exception:
-        pass
-    return default
 
 
 def dedupe_xy(

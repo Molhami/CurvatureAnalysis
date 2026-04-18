@@ -1,4 +1,4 @@
-"""Main application window - PyQt5 version, no Tkinter."""
+﻿"""Main application window - PyQt5 version, no Tkinter."""
 from __future__ import annotations
 
 import copy
@@ -15,12 +15,12 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QTabWidget, QScrollArea, QGroupBox, QLabel, QPushButton,
-    QSlider, QCheckBox, QComboBox, QLineEdit, QRadioButton, QButtonGroup,
+    QSlider, QCheckBox, QComboBox, QLineEdit,
     QTableWidget, QTableWidgetItem, QAbstractItemView, QProgressDialog,
     QMessageBox, QFileDialog, QAction, QFrame, QSizePolicy, QToolBar,
     QSpacerItem, QSpinBox,
 )
-from PyQt5.QtCore import Qt, QPoint, QPointF, QSize, pyqtSignal, QRect, QRectF
+from PyQt5.QtCore import Qt, QPoint, QPointF, QSize, pyqtSignal, QRect, QRectF, QTimer
 from PyQt5.QtGui import (
     QPainter, QPixmap, QImage, QColor, QPen, QBrush, QFont,
     QPainterPath, QTransform,
@@ -29,7 +29,6 @@ from PyQt5.QtGui import (
 from .detector import ContourDetector
 from .curvature import CurvatureEngine
 from .models import DetectParams, PreprocessParams
-from .utils import cv_to_pil_rgb
 
 # -- Colour palette (Catppuccin Mocha-inspired) -------------------------------
 _BG      = "#1e1e2e"
@@ -991,10 +990,27 @@ class MainWindow(QMainWindow):
 
         self._undo_stack: deque = deque(maxlen=20)
 
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
+        self._root_splitter = None  # set by _build_central
+        self._splitter_sized = False
+
         self._build_menu()
         self._build_toolbar()
         self._build_central()
         self.statusBar().showMessage("Ready - Ctrl+O to open an image.")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._splitter_sized and self._root_splitter is not None:
+            self._splitter_sized = True
+            total = self._root_splitter.width()
+            self._root_splitter.setSizes([
+                total * 1 // 6,
+                total * 3 // 6,
+                total * 2 // 6,
+            ])
 
     # -- Menu -----------------------------------------------------------------
 
@@ -1077,16 +1093,6 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        for label, view, tip in (
-            ("Preproc.", "preprocessed", "Show preprocessed grayscale image"),
-            ("Binary",  "binary",        "Show binary threshold mask"),
-            ("Contours","contours",      "Show detected contour overlay"),
-        ):
-            b = QPushButton(label)
-            b.setToolTip(tip)
-            b.clicked.connect(lambda _c, v=view: self.set_view(v))
-            tb.addWidget(b)
-
         self._btn_roi = QPushButton("  ROI")
         self._btn_roi.setCheckable(True)
         self._btn_roi.setToolTip(
@@ -1130,11 +1136,10 @@ class MainWindow(QMainWindow):
         root_splitter.setHandleWidth(4)
         self.setCentralWidget(root_splitter)
 
-        # Left: scrollable tab panel
+        # ── Panel 1 (1/6): tabs ──────────────────────────────────────────────
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        left_scroll.setMinimumWidth(350)
+        left_scroll.setMinimumWidth(200)
         left_scroll.setStyleSheet(
             f"QScrollArea {{ border: none; background: {_BG}; }}"
         )
@@ -1162,15 +1167,12 @@ class MainWindow(QMainWindow):
         left_scroll.setWidget(left_container)
         root_splitter.addWidget(left_scroll)
 
-        # Right: frame nav + canvas/histogram + table
-        right_w = QWidget()
-        right_vbox = QVBoxLayout(right_w)
-        right_vbox.setContentsMargins(4, 4, 4, 4)
-        right_vbox.setSpacing(4)
+        # ── Panel 2 (3/6): image canvas + frame nav ───────────────────────────
+        mid_w = QWidget()
+        mid_vbox = QVBoxLayout(mid_w)
+        mid_vbox.setContentsMargins(4, 4, 4, 4)
+        mid_vbox.setSpacing(4)
 
-        self._build_frame_nav(right_vbox)
-
-        # Canvas + histogram header
         view_row = QHBoxLayout()
         self.view_label = QLabel("View: (none)")
         self.view_label.setStyleSheet(
@@ -1178,10 +1180,7 @@ class MainWindow(QMainWindow):
         )
         view_row.addWidget(self.view_label)
         view_row.addStretch()
-        right_vbox.addLayout(view_row)
-
-        # Splitter: image canvas | histogram   (horizontal)
-        img_hist_split = QSplitter(Qt.Horizontal)
+        mid_vbox.addLayout(view_row)
 
         self.canvas = ImageCanvas()
         self.canvas.zoom_changed.connect(
@@ -1191,7 +1190,15 @@ class MainWindow(QMainWindow):
         self.canvas.points_captured.connect(self._on_canvas_points)
         self.canvas.roi_changed.connect(self._on_roi_changed)
         self.canvas.align_line_drawn.connect(self._on_align_line_drawn)
-        img_hist_split.addWidget(self.canvas)
+        mid_vbox.addWidget(self.canvas, stretch=1)
+
+        self._build_frame_nav(mid_vbox)
+
+        root_splitter.addWidget(mid_w)
+
+        # ── Panel 3 (2/6): histogram (top) + contour properties (bottom) ──────
+        right_col_split = QSplitter(Qt.Vertical)
+        right_col_split.setHandleWidth(4)
 
         hist_w = QWidget()
         hist_vbox = QVBoxLayout(hist_w)
@@ -1212,71 +1219,122 @@ class MainWindow(QMainWindow):
 
         self.histogram = HistogramWidget()
         hist_vbox.addWidget(self.histogram)
-        img_hist_split.addWidget(hist_w)
-
-        # Allow histogram to take up more default space
-        img_hist_split.setStretchFactor(0, 2)
-        img_hist_split.setStretchFactor(1, 1)
-        img_hist_split.setCollapsible(0, False)
-        img_hist_split.setCollapsible(1, False)
-
-        # Vertical splitter: (canvas+hist) | table
-        vert_split = QSplitter(Qt.Vertical)
-        vert_split.addWidget(img_hist_split)
+        right_col_split.addWidget(hist_w)
 
         table_w = QWidget()
         self._build_table(table_w)
-        vert_split.addWidget(table_w)
-        vert_split.setStretchFactor(0, 3)
-        vert_split.setStretchFactor(1, 1)
+        right_col_split.addWidget(table_w)
+        right_col_split.setStretchFactor(0, 1)
+        right_col_split.setStretchFactor(1, 1)
+        right_col_split.setCollapsible(0, False)
+        right_col_split.setCollapsible(1, False)
 
-        right_vbox.addWidget(vert_split, stretch=1)
-        root_splitter.addWidget(right_w)
+        root_splitter.addWidget(right_col_split)
 
-        root_splitter.setStretchFactor(0, 0)
-        root_splitter.setStretchFactor(1, 1)
+        # Proportions: 1 : 3 : 2
+        root_splitter.setStretchFactor(0, 1)
+        root_splitter.setStretchFactor(1, 3)
+        root_splitter.setStretchFactor(2, 2)
+        root_splitter.setCollapsible(0, False)
+        root_splitter.setCollapsible(1, False)
+        root_splitter.setCollapsible(2, False)
+
+        self._root_splitter = root_splitter
 
     # -- Frame navigation ------------------------------------------------------
 
     def _build_frame_nav(self, layout):
-        box = QGroupBox("Frame Navigation")
+        box = QGroupBox()
         row = QHBoxLayout(box)
         row.setContentsMargins(8, 4, 8, 4)
-        row.setSpacing(6)
+        row.setSpacing(4)
 
-        btn_prev = QPushButton("<")
-        btn_prev.setFixedWidth(30)
+        _btn_style = (
+            f"QPushButton {{ background: {_PANEL}; color: {_TEXT}; border: 1px solid {_BORDER};"
+            f"  border-radius: 6px; padding: 4px 8px; font-size: 16pt;"
+            f"  min-width: 36px; min-height: 36px; max-width: 44px; max-height: 44px; }}"
+            f"QPushButton:hover {{ background: {_WIDGET}; border-color: {_ACCENT}; }}"
+            f"QPushButton:pressed {{ background: {_ACCENT}; color: {_BG}; }}"
+        )
+
+        btn_first = QPushButton("\u23ee")
+        btn_first.setToolTip("First frame")
+        btn_first.setStyleSheet(_btn_style)
+        btn_first.clicked.connect(lambda: self.go_to_frame(0))
+
+        btn_prev = QPushButton("\u23ea")
+        btn_prev.setToolTip("Previous frame")
+        btn_prev.setStyleSheet(_btn_style)
         btn_prev.clicked.connect(self.prev_frame)
-        row.addWidget(btn_prev)
+
+        self._btn_play = QPushButton("\u25b6")
+        self._btn_play.setToolTip("Play / Stop")
+        self._btn_play.setCheckable(True)
+        self._btn_play.setStyleSheet(
+            _btn_style
+            + f"QPushButton:checked {{ background: {_ACCENT}; color: {_BG}; border-color: {_ACCENT}; }}"
+        )
+        self._btn_play.clicked.connect(self._on_play_toggle)
+
+        btn_next = QPushButton("\u23e9")
+        btn_next.setToolTip("Next frame")
+        btn_next.setStyleSheet(_btn_style)
+        btn_next.clicked.connect(self.next_frame)
+
+        btn_last = QPushButton("\u23ed")
+        btn_last.setToolTip("Last frame")
+        btn_last.setStyleSheet(_btn_style)
+        btn_last.clicked.connect(lambda: self.go_to_frame(
+            max(0, self.detector.num_frames - 1)
+        ))
+
+        for b in (btn_first, btn_prev, self._btn_play, btn_next, btn_last):
+            row.addWidget(b)
+
+        row.addSpacing(6)
 
         self.frame_slider = QSlider(Qt.Horizontal)
         self.frame_slider.setRange(0, 0)
         self.frame_slider.valueChanged.connect(self._on_frame_slider)
         row.addWidget(self.frame_slider, stretch=1)
 
-        btn_next = QPushButton(">")
-        btn_next.setFixedWidth(30)
-        btn_next.clicked.connect(self.next_frame)
-        row.addWidget(btn_next)
+        row.addSpacing(6)
 
         self.frame_info_lbl = QLabel("No image loaded")
         self.frame_info_lbl.setStyleSheet(f"color: {_ACCENT}; font-weight: bold;")
-        self.frame_info_lbl.setFixedWidth(130)
+        self.frame_info_lbl.setFixedWidth(110)
         self.frame_info_lbl.setAlignment(Qt.AlignCenter)
         row.addWidget(self.frame_info_lbl)
-
-        row.addWidget(QLabel("Go to:"))
-        self.frame_entry = QLineEdit()
-        self.frame_entry.setText("1")
-        self.frame_entry.setFixedWidth(48)
-        self.frame_entry.returnPressed.connect(self._on_frame_entry)
-        row.addWidget(self.frame_entry)
 
         self.detect_info_lbl = QLabel("")
         self.detect_info_lbl.setStyleSheet(f"color: {_SUBTEXT};")
         row.addWidget(self.detect_info_lbl)
 
         layout.addWidget(box)
+
+    def _on_play_toggle(self, checked: bool):
+        if checked:
+            if self.detector.num_frames < 2:
+                self._btn_play.setChecked(False)
+                return
+            self._btn_play.setText("\u23f9")   # ⏹ stop
+            self._btn_play.setToolTip("Stop")
+            self._play_timer.start(100)  # 10 fps
+        else:
+            self._play_timer.stop()
+            self._btn_play.setText("\u25b6")   # ▶ play
+            self._btn_play.setToolTip("Play / Stop")
+
+    def _play_tick(self):
+        if not self.detector.frames:
+            self._play_timer.stop()
+            self._btn_play.setChecked(False)
+            self._btn_play.setText("\u25b6")
+            return
+        next_idx = self.detector.current_frame_idx + 1
+        if next_idx >= self.detector.num_frames:
+            next_idx = 0   # loop
+        self.go_to_frame(next_idx)
 
     # -- Contour table ---------------------------------------------------------
 
@@ -1385,20 +1443,6 @@ class MainWindow(QMainWindow):
         ga_lay.addWidget(btn_rst)
         vbox.addWidget(grp_act)
 
-        # Preview
-        grp_prev = QGroupBox("Preview")
-        gp_lay = QVBoxLayout(grp_prev)
-        self.pre_preview = QLabel()
-        self.pre_preview.setAlignment(Qt.AlignCenter)
-        self.pre_preview.setMinimumHeight(160)
-        self.pre_preview.setStyleSheet(f"background: #0d0d1a; border-radius: 4px;")
-        gp_lay.addWidget(self.pre_preview)
-        self.pre_msg_lbl = QLabel("Open an image to preview preprocessing.")
-        self.pre_msg_lbl.setWordWrap(True)
-        self.pre_msg_lbl.setStyleSheet(f"color: {_SUBTEXT}; font-size: 9pt; padding: 2px;")
-        gp_lay.addWidget(self.pre_msg_lbl)
-        vbox.addWidget(grp_prev, stretch=1)
-
         vbox.addStretch()
 
     # -- Contour tab -----------------------------------------------------------
@@ -1418,20 +1462,6 @@ class MainWindow(QMainWindow):
         self.method_cb.currentTextChanged.connect(self._update_method_frames)
         gm_lay.addWidget(self.method_cb)
         vbox.addWidget(grp_m)
-
-        # Detection preprocessing
-        grp_dp = QGroupBox("Detection Preprocessing")
-        gdp = QVBoxLayout(grp_dp)
-        self.det_blur_sl = LabeledSlider("Extra blur ksize (odd):", 1, 31, 5)
-        self.det_blur_sl.setToolTip("Extra blur applied just before thresholding in the detector")
-        gdp.addWidget(self.det_blur_sl)
-        self.use_morph_cb = QCheckBox("Morphological closing")
-        self.use_morph_cb.setChecked(True)
-        gdp.addWidget(self.use_morph_cb)
-        self.morph_ksize_sl = LabeledSlider("Morph ksize (odd):", 1, 21, 5)
-        self.morph_ksize_sl.setToolTip("Morphological closing kernel size - helps fill contour gaps")
-        gdp.addWidget(self.morph_ksize_sl)
-        vbox.addWidget(grp_dp)
 
         # Threshold / Canny (toggleable)
         self.grp_thresh = QGroupBox("Threshold")
@@ -1469,22 +1499,6 @@ class MainWindow(QMainWindow):
         gf.addWidget(self.max_area_sl)
         gf.addWidget(self.min_rect_width_sl)
         vbox.addWidget(grp_f)
-
-        # Drawing options
-        grp_d = QGroupBox("Drawing")
-        gd = QVBoxLayout(grp_d)
-        self.draw_bbox_cb = QCheckBox("Bounding boxes")
-        self.draw_bbox_cb.setChecked(True)
-        self.draw_centroid_cb = QCheckBox("Centroids")
-        self.draw_centroid_cb.setChecked(True)
-        self.draw_labels_cb = QCheckBox("Labels")
-        self.draw_labels_cb.setChecked(True)
-        gd.addWidget(self.draw_bbox_cb)
-        gd.addWidget(self.draw_centroid_cb)
-        gd.addWidget(self.draw_labels_cb)
-        self.thickness_sl = LabeledSlider("Line thickness:", 1, 10, 2)
-        gd.addWidget(self.thickness_sl)
-        vbox.addWidget(grp_d)
 
         # Detect buttons
         btn_det = QPushButton("Detect Current Frame")
@@ -1539,20 +1553,6 @@ class MainWindow(QMainWindow):
         grp_src = QGroupBox("Source of Points")
         gs = QVBoxLayout(grp_src)
 
-        self.draw_enabled_cb = QCheckBox("Enable manual drawing (left-drag)")
-        self.draw_enabled_cb.stateChanged.connect(self._on_draw_enabled)
-        gs.addWidget(self.draw_enabled_cb)
-
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Draw mode:"))
-        self.mode_freehand = QRadioButton("Freehand")
-        self.mode_freehand.setChecked(True)
-        self.mode_circle = QRadioButton("Circle")
-        mode_row.addWidget(self.mode_freehand)
-        mode_row.addWidget(self.mode_circle)
-        mode_row.addStretch()
-        gs.addLayout(mode_row)
-
         btn_row = QHBoxLayout()
         btn_sel = QPushButton("Select contour")
         btn_sel.clicked.connect(self.use_selected_contour)
@@ -1576,21 +1576,11 @@ class MainWindow(QMainWindow):
         self.res_sl.setToolTip("Output spline point density multiplier")
         gc.addWidget(self.smooth_sl)
         gc.addWidget(self.res_sl)
-        btn_compute = QPushButton("Compute Curvature (Current)")
-        btn_compute.setObjectName("accentBtn")
-        btn_compute.setShortcut("Ctrl+Return")
-        btn_compute.setToolTip("Fit spline and compute curvature for current frame (Ctrl+Enter)")
-        btn_compute.clicked.connect(self.compute_curvature)
-
-        btn_compute_all = QPushButton("Compute Curvature (All Frames)")
-        btn_compute_all.setObjectName("greenBtn")
+        btn_compute_all = QPushButton("Compute Curvature")
+        btn_compute_all.setObjectName("accentBtn")
         btn_compute_all.setToolTip("Batch compute curvature on largest contour of every frame")
         btn_compute_all.clicked.connect(self.compute_curvature_all)
-
-        calc_btn_row = QHBoxLayout()
-        calc_btn_row.addWidget(btn_compute)
-        calc_btn_row.addWidget(btn_compute_all)
-        gc.addLayout(calc_btn_row)
+        gc.addWidget(btn_compute_all)
         vbox.addWidget(grp_calc)
 
         grp_vis = QGroupBox("Visualization")
@@ -1649,28 +1639,24 @@ class MainWindow(QMainWindow):
     def _get_detect_params(self) -> DetectParams:
         max_area = int(self.max_area_sl.get_value())
         max_area_val = max_area if max_area > 0 else None
-        k = int(self.det_blur_sl.get_value())
-        if k % 2 == 0:
-            k += 1
-        k = max(1, k)
         return DetectParams(
             method=self.method_cb.currentText(),
-            blur_ksize=k,
+            blur_ksize=1,
             thresh_value=int(self.thresh_sl.get_value()),
             canny_low=int(self.canny_low_sl.get_value()),
             canny_high=int(self.canny_high_sl.get_value()),
-            use_morphology=self.use_morph_cb.isChecked(),
-            morph_ksize=int(self.morph_ksize_sl.get_value()),
+            use_morphology=True,
+            morph_ksize=5,
             min_area=int(self.min_area_sl.get_value()),
             max_area=max_area_val,
             min_rect_width=int(self.min_rect_width_sl.get_value()),
             contour_color=(0, 255, 0),
             bbox_color=(255, 0, 0),
             centroid_color=(0, 0, 255),
-            thickness=int(self.thickness_sl.get_value()),
-            draw_bbox=self.draw_bbox_cb.isChecked(),
-            draw_centroid=self.draw_centroid_cb.isChecked(),
-            draw_labels=self.draw_labels_cb.isChecked(),
+            thickness=5,
+            draw_bbox=True,
+            draw_centroid=True,
+            draw_labels=True,
             reject_straight_lines=True,
             straight_line_tol=0.006,
         )
@@ -1716,7 +1702,6 @@ class MainWindow(QMainWindow):
         self.peak_norm_lbl.setText(
             f"Applied to {applied}/{n} frames - target peak: {target}"
         )
-        self._render_pre_preview()
         if self.detector.original is not None:
             pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
             self._update_histogram(pre_gray)
@@ -1739,31 +1724,9 @@ class MainWindow(QMainWindow):
         self._populate_table([])
         self._update_frame_ui()
         self._active_pre_key = None
-        self._render_pre_preview()
         if self.detector.original is not None:
             pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
             self._update_histogram(pre_gray)
-
-    def _render_pre_preview(self):
-        if self.detector.original is None:
-            self.pre_preview.setText("Open an image first")
-            self.pre_msg_lbl.setText("Open an image to preview preprocessing.")
-            return
-        try:
-            gray = self.detector.get_preprocessed_gray(self._current_pre_params())
-            pil = cv_to_pil_rgb(gray)
-            arr = __import__("numpy").array(pil)
-            h, w = arr.shape[:2]
-            qimg = QImage(arr.data.tobytes(), w, h, 3 * w, QImage.Format_RGB888)
-            pm = QPixmap.fromImage(qimg)
-            pw = self.pre_preview.width() or 320
-            ph = self.pre_preview.height() or 180
-            self.pre_preview.setPixmap(
-                pm.scaled(pw, ph, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            )
-            self.pre_msg_lbl.setText("Live preview - changes applied instantly.")
-        except Exception as e:
-            self.pre_msg_lbl.setText(f"Preview error: {e}")
 
     def _apply_preprocessing_all_frames(self):
         n = self.detector.num_frames
@@ -1917,7 +1880,6 @@ class MainWindow(QMainWindow):
             self.canvas.align_mode = False
             self._btn_align.setChecked(False)
             self.canvas.draw_enabled = False
-            self.draw_enabled_cb.setChecked(False)
             self.statusBar().showMessage("ROI mode: left-drag on canvas to draw the region.")
         else:
             self.canvas.roi_mode = False
@@ -1927,7 +1889,6 @@ class MainWindow(QMainWindow):
         self.canvas.align_mode = False
         self._btn_align.setChecked(False)
         self.canvas.draw_enabled = False
-        self.draw_enabled_cb.setChecked(False)
         self._btn_roi.setChecked(True)
         self.statusBar().showMessage("ROI mode: left-drag on canvas to draw the region.")
 
@@ -1999,7 +1960,6 @@ class MainWindow(QMainWindow):
         self._roi_status_lbl.setText("No ROI set")
         self._populate_table([])
 
-        self._render_pre_preview()
         pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
         self.canvas.set_image(pre_gray)
         self.canvas.fit_to_view()
@@ -2067,7 +2027,6 @@ class MainWindow(QMainWindow):
         # Refresh UI
         self.set_view(snap["current_view"])
         self._update_frame_ui()
-        self._render_pre_preview()
         if self.detector.original is not None:
             pre_gray = self.detector.get_preprocessed_gray(self._current_pre_params())
             self._update_histogram(pre_gray)
@@ -2090,7 +2049,6 @@ class MainWindow(QMainWindow):
             return
         self.canvas.align_mode = True
         self.canvas.draw_enabled = False
-        self.draw_enabled_cb.setChecked(False)
         self.canvas.roi_mode = False
         self._btn_roi.setChecked(False)
         self._btn_align.setChecked(True)
@@ -2231,7 +2189,6 @@ class MainWindow(QMainWindow):
         self.frame_slider.setValue(idx)
         self.frame_slider.blockSignals(False)
         self.frame_info_lbl.setText(f"Frame {idx + 1} / {n}")
-        self.frame_entry.setText(str(idx + 1))
         cached = self.detector.cache.get(idx)
         if cached:
             self.detect_info_lbl.setText(f"  {len(cached['contours'])} contour(s)")
@@ -2245,15 +2202,6 @@ class MainWindow(QMainWindow):
             return
         if val != self.detector.current_frame_idx:
             self.go_to_frame(val)
-
-    def _on_frame_entry(self):
-        if not self.detector.frames:
-            return
-        try:
-            idx = int(self.frame_entry.text()) - 1
-        except ValueError:
-            return
-        self.go_to_frame(idx)
 
     def go_to_frame(self, idx: int):
         if not self.detector.frames:
@@ -2286,7 +2234,6 @@ class MainWindow(QMainWindow):
             self.curv.curve_data = self.canvas.curve_data
             self.selected_contour_index = cached.get("selected_contour_index", None)
 
-        self._render_pre_preview()
         self._update_frame_ui()
         self._populate_table([] if cached is None else cached["properties"])
         self._refresh_view()
@@ -2325,19 +2272,6 @@ class MainWindow(QMainWindow):
         self.canvas.update()
 
     # -- Curvature actions -----------------------------------------------------
-
-    def _on_draw_enabled(self, state: int):
-        enabled = bool(state)
-        self.canvas.draw_enabled = enabled
-        if enabled:
-            self.canvas.align_mode = False
-            self._btn_align.setChecked(False)
-            self.canvas.roi_mode = False
-            self._btn_roi.setChecked(False)
-        self.curv_msg_lbl.setText(
-            "Left-drag to draw a curve on the image."
-            if enabled else "Manual drawing disabled."
-        )
 
     def _on_canvas_points(self, xs: list, ys: list):
         self.curv.set_points(xs, ys)
@@ -2694,7 +2628,6 @@ class MainWindow(QMainWindow):
             "  Ctrl+O  Open image\n"
             "  Ctrl+S  Save annotated\n"
             "  F       Fit to view\n"
-            "  â†/->     Navigate frames\n\n"
             "Canvas controls:\n"
             "  Scroll wheel  Zoom\n"
             "  Right-drag    Pan\n"
